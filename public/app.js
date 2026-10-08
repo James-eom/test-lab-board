@@ -39,7 +39,7 @@ async function init() {
   try {
     setup = (await api('/api/status')).setupRequired;
     $('#name-label').classList.toggle('hidden', !setup); $('#name-label input').required = setup;
-    $('#auth-title').textContent = setup ? '첫 관리자 등록' : '연구동 설비 가동현황';
+    $('#auth-title').textContent = setup ? '첫 관리자 등록' : '연구동 시험설비 가동현황';
     $('#auth-subtitle').textContent = setup ? '운영 PC에서 관리자 계정을 등록해 주세요.' : '팀 계정으로 로그인해 주세요.';
     $('#auth-submit').innerHTML = `${setup ? '관리자 등록' : '로그인'}${icon('arrow-right')}`;
     if (!setup) { try { const account = await api('/api/me'); me = account.user; csrf = account.csrf; } catch {} }
@@ -152,7 +152,7 @@ function reservationForm(r, equipmentId, day, minute) {
   const at = minute !== undefined ? Math.min(Math.max(Number(minute), data.rules.open), data.rules.close - 60) : data.rules.open;
   const start = r ? local(r.start) : local(new Date(new Date(midnight(d)).getTime() + (eq === 'endurance' && minute !== undefined ? Number(minute) : at) * 60000));
   const end = r ? local(r.end) : local(new Date(new Date(start + ':00+09:00').getTime() + 3600000));
-  modal(r ? '시험계획 수정' : '시험 등록', `<form id="reservation-form" data-id="${r?.id || ''}"><div class="form-grid"><label class="full">시험명<input name="title" value="${esc(r?.title || '')}" required maxlength="160"></label><label>시험실<select name="equipmentId">${data.equipment.map(e => option(e.id, e.name, eq)).join('')}</select></label><label>시험 종류<select name="testType"></select></label><label>차종 / 프로젝트<input name="project" value="${esc(r?.project || '')}" maxlength="100"></label><label>담당자<select name="ownerId">${data.users.map(u => option(u.id, u.name, r?.ownerId || me.id)).join('')}</select></label><label>시작 일시<input name="start" type="datetime-local" step="1800" value="${start}" required></label><label>종료 일시<input name="end" type="datetime-local" step="1800" value="${end}" required></label><label class="full checkbox-label"><input type="checkbox" name="includeWeekend" ${r?.includeWeekend ? 'checked' : ''}>주말 포함</label><label>상태<select name="status">${['계획', '진행', '완료', '취소'].map(s => option(s, s, r?.status || '계획')).join('')}</select></label>${r ? '<label>변경 사유<input name="reason" required maxlength="500"></label>' : ''}<label class="full">비고<textarea name="note" maxlength="2000">${esc(r?.note || '')}</textarea></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">${icon('check')}저장</button></div></form>`);
+  modal(r ? '시험계획 수정' : '시험 등록', `<form id="reservation-form" data-id="${r?.id || ''}"><div class="form-grid"><label class="full">차종 / 프로젝트<input name="project" value="${esc(r?.project || '')}" maxlength="100"></label><label>시험실<select name="equipmentId">${data.equipment.map(e => option(e.id, e.name, eq)).join('')}</select></label><label>시험 종류<select name="testType"></select></label><label class="full">담당자<select name="ownerId">${data.users.map(u => option(u.id, u.name, r?.ownerId || me.id)).join('')}</select></label><label>시작 일시<input name="start" type="datetime-local" step="1800" value="${start}" required></label><label>종료 일시<input name="end" type="datetime-local" step="1800" value="${end}" required></label><label class="full checkbox-label"><input type="checkbox" name="includeWeekend" ${r?.includeWeekend ? 'checked' : ''}>주말 포함</label><label>상태<select name="status">${['계획', '진행', '완료', '취소'].map(s => option(s, s, r?.status || '계획')).join('')}</select></label>${r ? '<label>변경 사유<input name="reason" required maxlength="500"></label>' : ''}<label class="full">비고<textarea name="note" maxlength="2000">${esc(r?.note || '')}</textarea></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">${icon('check')}저장</button></div></form>`);
   const form = $('#reservation-form'), typeSelect = form.elements.testType;
   const weekendLabel = form.elements.includeWeekend.closest('label');
   const syncWeekend = () => {
@@ -168,7 +168,7 @@ function reservationForm(r, equipmentId, day, minute) {
   };
   setTypes(); syncWeekend(); form.elements.equipmentId.onchange = () => { setTypes(); syncWeekend(); };
   form.elements.start.onchange = syncWeekend; form.elements.end.onchange = syncWeekend;
-  form.onsubmit = async event => { event.preventDefault(); syncWeekend(); const values = Object.fromEntries(new FormData(form)); values.includeWeekend = !form.elements.includeWeekend.disabled && form.elements.includeWeekend.checked; values.start = iso(values.start); values.end = iso(values.end); if (r) values.version = r.version;
+  form.onsubmit = async event => { event.preventDefault(); syncWeekend(); const values = Object.fromEntries(new FormData(form)); values.title = values.testType; values.includeWeekend = !form.elements.includeWeekend.disabled && form.elements.includeWeekend.checked; values.start = iso(values.start); values.end = iso(values.end); if (r) values.version = r.version;
     await saveForm(form, () => api('/api/reservations' + (r ? '/' + r.id : ''), r ? 'PUT' : 'POST', values), '시험계획을 저장했습니다.'); };
 }
 async function saveForm(form, operation, message) {
