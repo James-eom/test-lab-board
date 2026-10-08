@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>시험실 운영관리</title><link rel="stylesheet" href="/styles.css">
+  <script defer src="/vendor/lucide.js"></script><script defer src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-icon"><i data-lucide="flask-conical"></i></span><div>시험실 운영관리<small>LAB OPERATIONS</small></div></div>
+    <nav aria-label="주 메뉴">
+      <button class="nav active" data-page="schedule"><i data-lucide="calendar-range"></i>가동계획</button>
+      <button class="nav" data-page="tests"><i data-lucide="clipboard-list"></i>시험계획</button>
+      <button class="nav" data-page="capacity"><i data-lucide="chart-no-axes-combined"></i>설비 CAPA</button>
+      <button class="nav" data-page="history"><i data-lucide="history"></i>기준계획 · 이력</button>
+      <button class="nav" data-page="settings"><i data-lucide="settings-2"></i>운영 설정</button>
+    </nav>
+    <div class="sidebar-bottom"><span class="connection-dot"></span>회사 내부망 전용<small>대한민국 표준시 · UTC+9</small></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><span>시험팀 <span class="slash">/</span> 설비 운영</span><div class="account"><span id="sync-status">접속 확인 중</span><span id="user-name"></span><button id="logout" class="icon-button hidden" title="로그아웃" aria-label="로그아웃"><i data-lucide="log-out"></i></button></div></header>
+    <main>
+      <section id="auth-screen" class="auth-screen hidden">
+        <div class="auth-heading"><span class="eyebrow">TEST LAB / OPERATIONS</span><h1 id="auth-title">시험실 운영관리</h1><p id="auth-subtitle">팀 계정으로 로그인해 주세요.</p>
+          <div class="auth-facts"><div><strong>06</strong><span>관리 설비</span></div><div><strong>08:30</strong><span>기본 가동 시작</span></div><div><strong>24H</strong><span>단품 내구 연속 가동</span></div></div>
+        </div>
+        <form id="auth-form" class="auth-form"><label id="name-label" class="hidden">이름<input name="name" autocomplete="name" maxlength="40"></label><label>아이디<input name="login" autocomplete="username" required pattern="[a-zA-Z0-9._-]{3,40}" placeholder="영문·숫자 3~40자"></label><label>비밀번호<input name="password" type="password" autocomplete="current-password" required minlength="10" maxlength="200" placeholder="10자 이상"></label><p id="auth-error" class="error" role="alert"></p><button class="primary" type="submit" id="auth-submit">로그인<i data-lucide="arrow-right"></i></button></form>
+      </section>
+      <section id="app-screen" class="hidden">
+        <div class="page-heading"><div><span class="eyebrow">LAB OPERATIONS</span><h1 id="page-title">가동계획</h1><p id="page-description">장비별 시험 일정과 가동 시간을 확인합니다.</p></div><button class="primary" id="new-test"><i data-lucide="plus"></i>시험 등록</button></div>
+        <div id="error-banner" class="error-banner hidden" role="alert"></div>
+        <section class="summary-strip" id="summary-strip"></section>
+        <div class="toolbar"><div class="date-controls"><button class="icon-button" id="previous" title="이전 기간" aria-label="이전 기간"><i data-lucide="chevron-left"></i></button><button id="today" class="quiet">오늘</button><button class="icon-button" id="next" title="다음 기간" aria-label="다음 기간"><i data-lucide="chevron-right"></i></button><strong id="period-title"></strong><input id="date-picker" type="date" aria-label="기준 날짜"></div><div class="toolbar-actions"><div class="segmented" id="view-modes" role="group" aria-label="일정 보기"><button data-mode="month">월간</button><button class="selected" data-mode="week">주간</button><button data-mode="day">일간</button></div><button class="icon-button" id="refresh" title="새로고침" aria-label="새로고침"><i data-lucide="refresh-cw"></i></button><button class="icon-button" id="export" title="엑셀 내보내기" aria-label="엑셀 내보내기"><i data-lucide="download"></i></button></div></div>
+        <div class="filter-bar"><label class="search"><i data-lucide="search"></i><input id="search" type="search" placeholder="시험명 · 프로젝트 검색" aria-label="시험 검색"></label><select id="owner-filter" aria-label="담당자 필터"><option value="">모든 담당자</option></select><select id="status-filter" aria-label="상태 필터"><option value="">모든 상태</option><option>계획</option><option>진행</option><option>완료</option><option>취소</option></select><div class="legend"><span><b class="legend-plan"></b>계획</span><span><b class="legend-active"></b>진행</span><span><b class="legend-done"></b>완료</span><span><b class="legend-off"></b>비가동</span></div></div>
+        <div id="content"></div>
+        <footer class="page-footer"><span>계획 · 수정계획 · 가동실적</span><span id="footer-status">서버에 저장됩니다</span></footer>
+      </section>
+    </main>
+  </div>
+  <dialog id="modal"><div class="modal-heading"><h2 id="modal-title"></h2><button id="close-modal" class="icon-button" title="닫기" aria-label="닫기"><i data-lucide="x"></i></button></div><div id="modal-body"></div></dialog>
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>

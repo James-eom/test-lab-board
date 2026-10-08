@@ -1,0 +1,102 @@
+import http from 'node:http';
+import { readFile, mkdir } from 'node:fs/promises';
+import { dirname, resolve, extname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import XLSX from 'xlsx';
+import { Store, fail } from './src/store.mjs';
+import { EQUIPMENT, capacity, validateInterval, expandReservation } from './src/schedule.mjs';
+import { hashPassword, checkPassword, createSession, sessionFor } from './src/auth.mjs';
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+async function body(req) {
+  let value = ''; for await (const chunk of req) { value += chunk; if (Buffer.byteLength(value) > 65536) fail('요청이 너무 큽니다.', 413); }
+  try { const data = JSON.parse(value || '{}'); if (!data || Array.isArray(data) || typeof data !== 'object') fail('요청 형식을 확인해 주세요.'); return data; } catch { fail('요청 형식을 확인해 주세요.'); }
+}
+export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite') } = {}) {
+  const store = new Store(dbPath), attempts = new Map();
+  const server = http.createServer(async (req, res) => {
+    const json = (data, status = 200) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
+    const cookie = token => res.setHeader('set-cookie', `session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${token ? 43200 : 0}${process.env.COOKIE_SECURE === '1' ? '; Secure' : ''}`);
+    res.setHeader('x-content-type-options', 'nosniff'); res.setHeader('referrer-policy', 'same-origin'); res.setHeader('cache-control', 'no-store');
+    res.setHeader('content-security-policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'");
+    try {
+      const url = new URL(req.url, 'http://localhost'), path = url.pathname;
+      if (!path.startsWith('/api/')) {
+        if (req.method !== 'GET') fail('허용되지 않은 요청입니다.', 405);
+        let file;
+        if (path === '/vendor/lucide.js') file = resolve(ROOT, 'node_modules/lucide/dist/umd/lucide.js');
+        else { file = resolve(ROOT, 'public', '.' + decodeURIComponent(path === '/' ? '/index.html' : path)); if (!file.startsWith(resolve(ROOT, 'public') + '\\') && !file.startsWith(resolve(ROOT, 'public') + '/')) fail('파일을 찾을 수 없습니다.', 404); }
+        const data = await readFile(file).catch(() => fail('파일을 찾을 수 없습니다.', 404));
+        res.writeHead(200, { 'content-type': MIME[extname(file)] || 'application/octet-stream' }); return res.end(data);
+      }
+      if (req.method !== 'GET' && req.headers.origin) { let origin; try { origin = new URL(req.headers.origin); } catch { fail('허용되지 않은 출처입니다.', 403); } if (origin.host !== req.headers.host) fail('허용되지 않은 출처입니다.', 403); }
+      if (path === '/api/status' && req.method === 'GET') return json({ setupRequired: store.users().length === 0 });
+      if (path === '/api/setup' && req.method === 'POST') {
+        if (store.users().length) fail('관리자가 이미 등록돼 있습니다.', 409);
+        if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress)) fail('첫 관리자 등록은 운영 PC에서 진행해 주세요.', 403);
+        const data = await body(req);
+        if (store.users().length) fail('관리자가 이미 등록돼 있습니다.', 409);
+        const user = store.addUser(data.login, data.name, hashPassword(data.password), 'admin'); const session = createSession(store, user.id); cookie(session.token); return json({ user, csrf: session.csrf }, 201);
+      }
+      if (path === '/api/login' && req.method === 'POST') {
+        const ip = req.socket.remoteAddress, count = attempts.get(ip) || { n: 0, until: Date.now() + 600000 };
+        if (count.until < Date.now()) { count.n = 0; count.until = Date.now() + 600000; }
+        if (count.n >= 10) fail('잠시 후 다시 로그인해 주세요.', 429);
+        const data = await body(req), u = typeof data.login === 'string' ? store.db.prepare('SELECT * FROM users WHERE login=?').get(data.login) : null;
+        if (!u || !checkPassword(data.password, u.hash)) { count.n++; attempts.set(ip, count); fail('아이디 또는 비밀번호를 확인해 주세요.', 401); }
+        attempts.delete(ip); const session = createSession(store, u.id); cookie(session.token); return json({ user: store.users().find(x => x.id === u.id), csrf: session.csrf });
+      }
+      const session = sessionFor(store, req); if (!session) fail('로그인이 필요합니다.', 401);
+      if (req.method !== 'GET' && req.headers['x-csrf-token'] !== session.csrf) fail('요청을 확인할 수 없습니다. 다시 로그인해 주세요.', 403);
+      const admin = () => { if (session.user.role !== 'admin') fail('관리자 권한이 필요합니다.', 403); };
+      if (path === '/api/me' && req.method === 'GET') return json({ user: session.user, csrf: session.csrf });
+      if (path === '/api/logout' && req.method === 'POST') { store.db.prepare('DELETE FROM sessions WHERE token=?').run(session.token); cookie(''); return json({ ok: true }); }
+      if (path === '/api/users' && req.method === 'POST') { admin(); const d = await body(req); if (store.users().length >= 6) fail('첫 버전은 팀원 6명까지 등록할 수 있습니다.'); return json(store.addUser(d.login, d.name, hashPassword(d.password), d.role || 'member'), 201); }
+      if (path === '/api/state' && req.method === 'GET') return json({ equipment: EQUIPMENT, users: store.users(), reservations: store.reservations().map(r => ({ ...r, intervals: r.status === '취소' ? [] : expandReservation(r, store.rules()) })), actuals: store.actuals(), baselines: store.baselines(), downtimes: store.downtimes(), rules: store.rules() });
+      if (path === '/api/equipment' && req.method === 'GET') return json(EQUIPMENT);
+      if (path === '/api/reservations' && req.method === 'GET') return json(store.reservations());
+      if (path === '/api/reservations' && req.method === 'POST') return json(store.saveReservation(await body(req), session.user.id), 201);
+      const history = /^\/api\/reservations\/([^/]+)\/history$/.exec(path);
+      if (history && req.method === 'GET') return json(store.history(history[1]));
+      const edit = /^\/api\/reservations\/([^/]+)$/.exec(path);
+      if (edit && req.method === 'PUT') return json(store.saveReservation(await body(req), session.user.id, edit[1]));
+      if (path === '/api/actuals' && req.method === 'POST') return json(store.saveActual(await body(req), session.user.id));
+      if (path === '/api/baselines' && req.method === 'POST') { admin(); return json(store.saveBaseline((await body(req)).month, session.user.id), 201); }
+      if (path === '/api/downtimes' && req.method === 'POST') { admin(); return json(store.saveDowntime(await body(req), session.user.id), 201); }
+      if (/^\/api\/downtimes\/[^/]+$/.test(path) && req.method === 'DELETE') { admin(); store.removeDowntime(path.split('/').at(-1)); return json({ ok: true }); }
+      if (path === '/api/settings' && req.method === 'PUT') { admin(); return json(store.saveRules(await body(req))); }
+      if (path === '/api/capacity' && req.method === 'GET') {
+        const start = url.searchParams.get('start'), end = url.searchParams.get('end'); validateInterval(start, end);
+        const all = store.reservations(), actuals = store.actuals(), rules = store.rules(), stops = store.downtimes();
+        return json(EQUIPMENT.map(e => {
+          const bookings = all.filter(r => r.equipmentId === e.id && r.status !== '취소' && r.start < new Date(end).toISOString() && r.end > new Date(start).toISOString());
+          const cap = capacity({ equipmentId: e.id, start, end, reservations: bookings, rules, downtimes: stops.filter(d => d.equipmentId === e.id) });
+          const recorded = bookings.flatMap(r => { const a = actuals.find(a => a.reservationId === r.id); return a && !a.zero ? [{ ...r, start: a.start, end: a.end }] : []; });
+          const actualMinutes = capacity({ equipmentId: e.id, start, end, reservations: recorded, rules, downtimes: stops.filter(d => d.equipmentId === e.id) }).plannedMinutes;
+          return { ...e, ...cap, actualMinutes, missingActuals: bookings.filter(r => !actuals.some(a => a.reservationId === r.id)).length, totalBookings: bookings.length };
+        }));
+      }
+      if (path === '/api/export' && req.method === 'GET') {
+        const start = url.searchParams.get('start'), end = url.searchParams.get('end'); validateInterval(start, end);
+        const rows = store.reservations().filter(r => r.start < new Date(end).toISOString() && r.end > new Date(start).toISOString()).map(r => {
+          const a = store.actuals().find(a => a.reservationId === r.id);
+          return { 시험명: r.title, 프로젝트: r.project, 시험실: EQUIPMENT.find(e => e.id === r.equipmentId).name, 시험종류: r.testType, 담당자: store.users().find(u => u.id === r.ownerId)?.name, 시작: new Date(r.start), 종료: new Date(r.end), 상태: r.status, 실적: !a ? '미입력' : a.zero ? '0시간' : '입력', 실제시작: a?.start ? new Date(a.start) : '', 실제종료: a?.end ? new Date(a.end) : '', 비고: r.note };
+        });
+        const sheet = rows.length ? XLSX.utils.json_to_sheet(rows, { cellDates: true, dateNF: 'yyyy-mm-dd hh:mm' }) : XLSX.utils.aoa_to_sheet([['시험명', '프로젝트', '시험실', '시험종류', '담당자', '시작', '종료', '상태', '실적']]);
+        // Excel stores dates without a timezone; export Korea wall-clock values.
+        for (const cell of Object.values(sheet)) if (cell?.t === 'd') { cell.t = 'n'; cell.v = (cell.v.getTime() + 9 * 3600000 - Date.UTC(1899, 11, 30)) / 86400000; cell.z = 'yyyy-mm-dd hh:mm'; }
+        sheet['!cols'] = [32, 20, 26, 22, 15, 22, 22, 12, 12, 22, 22, 40].map(wch => ({ wch }));
+        const book = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(book, sheet, '시험계획');
+        res.writeHead(200, { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'content-disposition': 'attachment; filename="lab-schedule.xlsx"' }); return res.end(XLSX.write(book, { type: 'buffer', bookType: 'xlsx', cellDates: true }));
+      }
+      fail('요청을 찾을 수 없습니다.', 404);
+    } catch (e) { if (!e.status) console.error(e); json({ error: e.status ? e.message : '처리 중 문제가 발생했습니다. 입력을 확인해 주세요.' }, e.status || (e instanceof RangeError ? 400 : 500)); }
+  });
+  return { server, store };
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const dbPath = process.env.DB_PATH || resolve(ROOT, 'data/lab.sqlite'); await mkdir(dirname(dbPath), { recursive: true });
+  const { server } = createApp({ dbPath });
+  const host = process.env.HOST || '127.0.0.1', port = Number(process.env.PORT || 4317);
+  server.listen(port, host, () => console.log(`Lab Planner: http://${host}:${port}`));
+}
