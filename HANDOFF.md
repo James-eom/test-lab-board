@@ -6,7 +6,7 @@
 
 - GitHub 저장소: `https://github.com/James-eom/test-lab-board`
 - 기준 브랜치: `main`
-- 현재 기준 커밋: `ff205da`
+- 현재 기준 커밋: GitHub `main` 브랜치 최신 커밋
 - 앱 종류: Node.js native HTTP 서버 + SQLite + 정적 HTML/CSS/JavaScript
 - 기본 주소: `http://127.0.0.1:4317`
 - 용도: 회사 내부망에서 6명이 시험실 가동계획과 실적을 공동 관리
@@ -50,6 +50,10 @@ Node.js 24 LTS가 필요합니다. `pnpm`을 사용한다면 `pnpm install`, `pn
 - 월간 기준계획 저장과 변경 비교
 - Excel 내보내기와 SQLite 온라인 백업
 - 우신 로고 및 `연구동 시험설비 가동현황` 브랜딩
+- 상단 요약 카드 4개 바로가기
+  - 관리 설비·계획 점유율 → 설비 CAPA
+  - 등록된 시험 → 시험계획
+  - 실적 미입력 → 미입력 시험만 표시하는 시험계획
 
 ## 데이터 주의사항
 
@@ -83,6 +87,7 @@ UI 테스트는 별도 테스트 데이터베이스를 사용합니다.
 - `public/styles.css`: 전체 화면 스타일
 - `tests/`: 핵심 로직 및 UI 테스트
 - `README.md`: 운영 전 확인사항과 상세 기능 메모
+- `HANDOFF.md`: 다른 컴퓨터에서 이어서 작업하기 위한 안내
 
 ## 아직 운영 전에 결정할 항목
 
