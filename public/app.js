@@ -16,7 +16,7 @@ const hours = minutes => (minutes / 60).toLocaleString('ko-KR', { maximumFractio
 const iso = value => new Date(value + ':00+09:00').toISOString();
 const statusClass = value => ({ 진행: 'running', 완료: 'complete', 취소: 'cancelled' })[value] || '';
 let me, csrf = '', setup = false, data, capa = [], page = 'schedule', mode = 'week', date = today(), refreshBusy = false;
-let search = '', owner = '', status = '';
+let search = '', owner = '', status = '', actualState = '';
 const userName = id => data.users.find(u => u.id === id)?.name || '미지정';
 const equipmentName = id => data.equipment.find(e => e.id === id)?.name || id;
 function period() {
@@ -26,7 +26,7 @@ function period() {
   const end = addDays(start, n); return { start, end, days: Array.from({ length: n }, (_, i) => addDays(start, i)) };
 }
 function filtered() {
-  const p = period(); return data.reservations.filter(r => (!owner || r.ownerId === owner) && (!status || r.status === status) && (!search || (r.title + ' ' + r.project).toLowerCase().includes(search.toLowerCase())) && r.start < new Date(midnight(p.end)).toISOString() && r.end > new Date(midnight(p.start)).toISOString());
+  const p = period(); return data.reservations.filter(r => (!owner || r.ownerId === owner) && (!status || r.status === status) && (!actualState || (actualState === 'missing' && !data.actuals.some(a => a.reservationId === r.id))) && (!search || (r.title + ' ' + r.project).toLowerCase().includes(search.toLowerCase())) && r.start < new Date(midnight(p.end)).toISOString() && r.end > new Date(midnight(p.start)).toISOString());
 }
 async function api(path, method = 'GET', body) {
   const response = await fetch(path, { method, headers: { 'content-type': 'application/json', 'x-csrf-token': csrf }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -73,7 +73,7 @@ function render() {
   $('#summary-strip').innerHTML = [
     ['관리 설비', '6', '대', '시험실 운영 기준 적용', 'boxes', false], ['등록된 시험', selected.length, '건', `진행 ${running}건 · 선택 기간`, 'clipboard-list', false],
     ['계획 점유율', available ? (planned / available * 100).toFixed(1) : '—', available ? '%' : '', `${hours(planned)} / ${hours(available)}시간 · 전체 설비`, 'gauge', true], ['실적 미입력', missing, '건', '계획 시간을 실적으로 대체하지 않음', 'clock-3', false]
-  ].map(([label, v, unit, note, i, emphasis]) => `<div class="metric"><span class="metric-label">${icon(i)}${label}</span><div class="metric-value ${emphasis ? 'emphasis' : ''}">${v}<span>${unit}</span></div><span class="metric-note">${note}</span></div>`).join('');
+  ].map(([label, v, unit, note, i, emphasis], index) => `<button class="metric" data-summary="${['equipment', 'tests', 'occupancy', 'missing'][index]}" type="button"><span class="metric-label">${icon(i)}${label}</span><span class="metric-value ${emphasis ? 'emphasis' : ''}">${v}<span>${unit}</span></span><span class="metric-note">${note}</span></button>`).join('');
   $('#new-test').classList.toggle('hidden', ['history', 'settings'].includes(page));
   $('.filter-bar').classList.toggle('hidden', ['capacity', 'history', 'settings'].includes(page));
   $('#content').innerHTML = page === 'schedule' ? scheduleView() : page === 'tests' ? testsView() : page === 'capacity' ? capacityView() : page === 'history' ? historyView() : settingsView();
@@ -212,7 +212,13 @@ $('#auth-form').onsubmit = async event => { event.preventDefault(); const form =
   try { const account = await api(setup ? '/api/setup' : '/api/login', 'POST', Object.fromEntries(new FormData(form))); me = account.user; csrf = account.csrf; setup = false; await enter(); }
   catch (e) { $('#auth-error').textContent = e.message; } finally { button.disabled = false; } };
 $('#logout').onclick = async () => { try { await api('/api/logout', 'POST'); me = null; csrf = ''; await init(); } catch (e) { error(e.message); } };
-$('.sidebar nav').onclick = event => { const button = event.target.closest('[data-page]'); if (button && me) { page = button.dataset.page; render(); } };
+$('.sidebar nav').onclick = event => { const button = event.target.closest('[data-page]'); if (button && me) { page = button.dataset.page; actualState = ''; render(); } };
+document.addEventListener('click', event => {
+  const card = event.target.closest('[data-summary]'); if (!card || !me) return;
+  page = ['equipment', 'occupancy'].includes(card.dataset.summary) ? 'capacity' : 'tests';
+  actualState = card.dataset.summary === 'missing' ? 'missing' : '';
+  search = ''; owner = ''; status = ''; render();
+});
 $('#view-modes').onclick = event => { const button = event.target.closest('[data-mode]'); if (button) { mode = button.dataset.mode; refresh(); } };
 $('#previous').onclick = () => move(-1); $('#next').onclick = () => move(1);
 function move(direction) { if (mode === 'month') { const d = new Date(date.slice(0, 7) + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + direction); date = d.toISOString().slice(0, 10); } else date = addDays(date, direction * (mode === 'week' ? 7 : 1)); refresh(); }

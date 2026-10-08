@@ -16,6 +16,12 @@ test('two team sessions, calendars, actuals, settings, and mobile layout', async
   await page.locator('#auth-form [name=password]').fill('test-only-password-123');
   await page.locator('#auth-submit').click();
   await expect(page.locator('.schedule-table tbody tr')).toHaveCount(6);
+  await expect(page.locator('[data-summary]')).toHaveCount(4);
+  await page.locator('[data-summary="tests"]').click();
+  await expect(page.locator('#page-title')).toHaveText('시험계획');
+  await page.locator('[data-summary="occupancy"]').click();
+  await expect(page.locator('#page-title')).toHaveText('설비 CAPA');
+  await page.locator('[data-page="schedule"]').click();
   await page.locator('#date-picker').fill('2026-10-12');
   await page.locator('#date-picker').dispatchEvent('change');
   await expect(page.locator('#period-title')).toContainText('12일');
@@ -50,6 +56,10 @@ test('two team sessions, calendars, actuals, settings, and mobile layout', async
   const thermalComparison = page.locator('.schedule-table tbody tr').filter({ hasText: '열가진 내구시험실 #1' }).locator('.equipment-comparison');
   await expect(thermalComparison).toContainText('최초 계획36 h');
   await expect(thermalComparison).toContainText('미입력 1건');
+  await page.locator('[data-summary="missing"]').click();
+  await expect(page.locator('#page-title')).toHaveText('시험계획');
+  await expect(page.locator('.data-table')).toContainText('KA5 t-car');
+  await page.locator('[data-page="schedule"]').click();
   await page2.locator('#date-picker').fill('2026-10-12'); await page2.locator('#date-picker').dispatchEvent('change');
   await expect(page2.locator('.booking')).toHaveCount(3);
   await page.locator('#new-test').click();
