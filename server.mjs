@@ -4,7 +4,7 @@ import { dirname, resolve, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import XLSX from 'xlsx';
 import { Store, fail } from './src/store.mjs';
-import { EQUIPMENT, capacity, validateInterval, expandReservation } from './src/schedule.mjs';
+import { EQUIPMENT, capacity, validateInterval, expandReservation, activeIntervals, merge } from './src/schedule.mjs';
 import { hashPassword, checkPassword, createSession, sessionFor } from './src/auth.mjs';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
@@ -52,7 +52,7 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite') } = {}) {
       if (path === '/api/me' && req.method === 'GET') return json({ user: session.user, csrf: session.csrf });
       if (path === '/api/logout' && req.method === 'POST') { store.db.prepare('DELETE FROM sessions WHERE token=?').run(session.token); cookie(''); return json({ ok: true }); }
       if (path === '/api/users' && req.method === 'POST') { admin(); const d = await body(req); if (store.users().length >= 6) fail('첫 버전은 팀원 6명까지 등록할 수 있습니다.'); return json(store.addUser(d.login, d.name, hashPassword(d.password), d.role || 'member'), 201); }
-      if (path === '/api/state' && req.method === 'GET') return json({ equipment: EQUIPMENT, users: store.users(), reservations: store.reservations().map(r => ({ ...r, intervals: r.status === '취소' ? [] : expandReservation(r, store.rules()) })), actuals: store.actuals(), baselines: store.baselines(), downtimes: store.downtimes(), rules: store.rules() });
+      if (path === '/api/state' && req.method === 'GET') return json({ equipment: EQUIPMENT, users: store.users(), reservations: store.reservations().map(r => ({ ...r, intervals: r.status === '취소' ? [] : expandReservation(r, store.rules()) })), actuals: store.actuals().map(a => ({ ...a, intervals: a.zero ? [] : expandReservation({ ...store.reservation(a.reservationId), ...a }, store.rules()) })), baselines: store.baselines(), downtimes: store.downtimes(), rules: store.rules() });
       if (path === '/api/equipment' && req.method === 'GET') return json(EQUIPMENT);
       if (path === '/api/reservations' && req.method === 'GET') return json(store.reservations());
       if (path === '/api/reservations' && req.method === 'POST') return json(store.saveReservation(await body(req), session.user.id), 201);
@@ -61,36 +61,46 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite') } = {}) {
       const edit = /^\/api\/reservations\/([^/]+)$/.exec(path);
       if (edit && req.method === 'PUT') return json(store.saveReservation(await body(req), session.user.id, edit[1]));
       if (path === '/api/actuals' && req.method === 'POST') return json(store.saveActual(await body(req), session.user.id));
+      if (/^\/api\/actuals\/[^/]+$/.test(path) && req.method === 'DELETE') { store.removeActual(path.split('/').at(-1)); return json({ ok: true }); }
       if (path === '/api/baselines' && req.method === 'POST') { admin(); return json(store.saveBaseline((await body(req)).month, session.user.id), 201); }
       if (path === '/api/downtimes' && req.method === 'POST') { admin(); return json(store.saveDowntime(await body(req), session.user.id), 201); }
       if (/^\/api\/downtimes\/[^/]+$/.test(path) && req.method === 'DELETE') { admin(); store.removeDowntime(path.split('/').at(-1)); return json({ ok: true }); }
       if (path === '/api/settings' && req.method === 'PUT') { admin(); return json(store.saveRules(await body(req))); }
       if (path === '/api/capacity' && req.method === 'GET') {
         const start = url.searchParams.get('start'), end = url.searchParams.get('end'); validateInterval(start, end);
-        const all = store.reservations(), actuals = store.actuals(), rules = store.rules(), stops = store.downtimes();
+        const all = store.reservations(), actuals = store.actuals(), rules = store.rules(), stops = store.downtimes(), originals = store.originalPlans();
+        const periodStart = new Date(start).getTime(), periodEnd = new Date(end).getTime();
+        const overlaps = intervals => intervals.some(([a, b]) => a < periodEnd && b > periodStart);
         return json(EQUIPMENT.map(e => {
           const bookings = all.filter(r => r.equipmentId === e.id && r.status !== '취소' && r.start < new Date(end).toISOString() && r.end > new Date(start).toISOString());
           const cap = capacity({ equipmentId: e.id, start, end, reservations: bookings, rules, downtimes: stops.filter(d => d.equipmentId === e.id) });
           const recorded = bookings.flatMap(r => { const a = actuals.find(a => a.reservationId === r.id); return a && !a.zero ? [{ ...r, start: a.start, end: a.end }] : []; });
           const actualMinutes = capacity({ equipmentId: e.id, start, end, reservations: recorded, rules, downtimes: stops.filter(d => d.equipmentId === e.id) }).plannedMinutes;
-          return { ...e, ...cap, actualMinutes, missingActuals: bookings.filter(r => !actuals.some(a => a.reservationId === r.id)).length, totalBookings: bookings.length };
+          const originalBookings = originals.filter(r => r.equipmentId === e.id && (r.plannedIntervals ? overlaps(r.plannedIntervals) : new Date(r.start).getTime() < periodEnd && new Date(r.end).getTime() > periodStart));
+          const unknownOriginalPlans = originalBookings.filter(r => r.plannedIntervals === null).length;
+          const originalPlanMinutes = unknownOriginalPlans ? null : merge(originalBookings.flatMap(r => r.plannedIntervals)).reduce((total, [a, b]) => total + Math.max(0, Math.min(b, periodEnd) - Math.max(a, periodStart)) / 60000, 0);
+          const expected = new Set([...originalBookings, ...bookings.filter(r => overlaps(activeIntervals(r, rules)))].filter(r => all.find(current => current.id === r.id)?.status !== '취소').map(r => r.id));
+          const originalMissingActuals = [...expected].filter(id => !actuals.some(a => a.reservationId === id)).length;
+          return { ...e, ...cap, actualMinutes, originalPlanMinutes, originalMissingActuals, unknownOriginalPlans,
+            originalAchievementPercent: originalPlanMinutes > 0 ? actualMinutes / originalPlanMinutes * 100 : null,
+            missingActuals: bookings.filter(r => !actuals.some(a => a.reservationId === r.id)).length, totalBookings: bookings.length };
         }));
       }
       if (path === '/api/export' && req.method === 'GET') {
         const start = url.searchParams.get('start'), end = url.searchParams.get('end'); validateInterval(start, end);
         const rows = store.reservations().filter(r => r.start < new Date(end).toISOString() && r.end > new Date(start).toISOString()).map(r => {
           const a = store.actuals().find(a => a.reservationId === r.id);
-          return { 시험명: r.title, 프로젝트: r.project, 시험실: EQUIPMENT.find(e => e.id === r.equipmentId).name, 시험종류: r.testType, 담당자: store.users().find(u => u.id === r.ownerId)?.name, 시작: new Date(r.start), 종료: new Date(r.end), 상태: r.status, 실적: !a ? '미입력' : a.zero ? '0시간' : '입력', 실제시작: a?.start ? new Date(a.start) : '', 실제종료: a?.end ? new Date(a.end) : '', 비고: r.note };
+          return { 시험명: r.title, 프로젝트: r.project, 시험실: EQUIPMENT.find(e => e.id === r.equipmentId).name, 시험종류: r.testType, 담당자: store.users().find(u => u.id === r.ownerId)?.name, 시작: new Date(r.start), 종료: new Date(r.end), 상태: r.status, 실적: !a ? '미입력' : a.zero ? '0시간' : '입력', 실제시작: a?.start ? new Date(a.start) : '', 실제종료: a?.end ? new Date(a.end) : '', 비고: r.note, 주말포함: r.includeWeekend ? '포함' : r.equipmentId === 'endurance' ? '연속 가동' : '기본 운영일' };
         });
         const sheet = rows.length ? XLSX.utils.json_to_sheet(rows, { cellDates: true, dateNF: 'yyyy-mm-dd hh:mm' }) : XLSX.utils.aoa_to_sheet([['시험명', '프로젝트', '시험실', '시험종류', '담당자', '시작', '종료', '상태', '실적']]);
         // Excel stores dates without a timezone; export Korea wall-clock values.
         for (const cell of Object.values(sheet)) if (cell?.t === 'd') { cell.t = 'n'; cell.v = (cell.v.getTime() + 9 * 3600000 - Date.UTC(1899, 11, 30)) / 86400000; cell.z = 'yyyy-mm-dd hh:mm'; }
-        sheet['!cols'] = [32, 20, 26, 22, 15, 22, 22, 12, 12, 22, 22, 40].map(wch => ({ wch }));
+        sheet['!cols'] = [32, 20, 26, 22, 15, 22, 22, 12, 12, 22, 22, 40, 15].map(wch => ({ wch }));
         const book = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(book, sheet, '시험계획');
         res.writeHead(200, { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'content-disposition': 'attachment; filename="lab-schedule.xlsx"' }); return res.end(XLSX.write(book, { type: 'buffer', bookType: 'xlsx', cellDates: true }));
       }
       fail('요청을 찾을 수 없습니다.', 404);
-    } catch (e) { if (!e.status) console.error(e); json({ error: e.status ? e.message : '처리 중 문제가 발생했습니다. 입력을 확인해 주세요.' }, e.status || (e instanceof RangeError ? 400 : 500)); }
+    } catch (e) { if (!e.status) console.error(e); json({ code: e.code, error: e.status ? e.message : '처리 중 문제가 발생했습니다. 입력을 확인해 주세요.' }, e.status || (e instanceof RangeError ? 400 : 500)); }
   });
   return { server, store };
 }
