@@ -60,7 +60,7 @@ test('setup, authentication, csrf, reservation validation, and export', async ()
     comparison = await engine();
     assert.equal(comparison.originalPlanMinutes, 180);
     assert.equal(comparison.originalMissingActuals, 0);
-    store.saveReservation({ ...booking, equipmentId: 'engine-2', start: '2026-10-09T08:30:00+09:00', end: '2026-10-12T09:30:00+09:00' }, account.user.id);
+    store.saveReservation({ ...booking, equipmentId: 'engine-2', start: '2026-10-08T08:30:00+09:00', end: '2026-10-12T09:30:00+09:00' }, account.user.id);
     const weekend = (await (await request('/api/capacity?start=2026-10-10T00:00:00%2B09:00&end=2026-10-11T00:00:00%2B09:00')).json()).find(e => e.id === 'engine-2');
     assert.equal(weekend.originalPlanMinutes, 0);
     assert.equal(weekend.originalMissingActuals, 0);
@@ -91,5 +91,26 @@ test('setup, authentication, csrf, reservation validation, and export', async ()
     const combined = (await (await request('/api/capacity?start=2026-10-10T00:00:00%2B09:00&end=2026-10-11T00:00:00%2B09:00')).json()).find(e => e.id === 'engine-1');
     assert.equal(combined.plannedMinutes, 60); assert.equal(combined.actualMinutes, 60);
     assert.equal(combined.originalPlanMinutes, 60); assert.equal(combined.originalAchievementPercent, 100);
+    assert.equal((await request('/api/holidays', 'POST', { date: '2026-10-12', name: '임시공휴일' }, false)).status, 403);
+    assert.equal((await request('/api/holidays', 'POST', { date: '2026-10-12', name: '임시공휴일' })).status, 201);
+    const holidayState = await (await request('/api/state')).json();
+    assert.deepEqual(holidayState.reservations.find(r => r.id === changed.id).intervals, []);
+    assert.ok(holidayState.rules.holidays.some(h => h.date === '2026-10-09'));
+    assert.deepEqual(holidayState.holidayYears, [2026, 2027]);
+    store.saveActual({ reservationId: changed.id, start: changed.start, end: changed.end }, account.user.id);
+    const holidayComparison = await engine();
+    assert.equal(holidayComparison.availableMinutes, 0);
+    assert.equal(holidayComparison.plannedMinutes, 0);
+    assert.equal(holidayComparison.actualMinutes, 120);
+    assert.equal(holidayComparison.originalPlanMinutes, 180);
+    assert.equal((await request('/api/holidays/2026-10-12', 'DELETE')).status, 200);
+    assert.equal((await request('/api/holidays/2026-10-09', 'DELETE')).status, 404);
+    assert.equal((await engine()).availableMinutes, 630);
+    assert.equal((await request('/api/users', 'POST', { login: 'member', name: '담당자', password: 'another-password' })).status, 201);
+    await request('/api/logout', 'POST');
+    const memberLogin = await request('/api/login', 'POST', { login: 'member', password: 'another-password' });
+    assert.equal(memberLogin.status, 200); csrf = (await memberLogin.json()).csrf;
+    assert.equal((await request('/api/holidays', 'POST', { date: '2026-10-13', name: '금지' })).status, 403);
+    assert.equal((await request('/api/holidays/2026-10-09', 'DELETE')).status, 403);
   } finally { await new Promise(resolve => server.close(resolve)); store.db.close(); }
 });

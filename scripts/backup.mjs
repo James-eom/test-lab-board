@@ -1,12 +1,8 @@
-import { DatabaseSync, backup } from 'node:sqlite';
-import { mkdir } from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
+import { verifiedBackup } from '../src/backup.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const db = new DatabaseSync(process.env.DB_PATH || resolve(root, 'data/lab.sqlite'), { readOnly: true });
-const folder = process.env.BACKUP_DIR || resolve(root, 'data/backups'); await mkdir(folder, { recursive: true });
-const target = resolve(folder, `lab-${new Date().toISOString().replace(/[:.]/g, '-')}.sqlite`);
-await backup(db, target); db.close();
-const check = new DatabaseSync(target, { readOnly: true });
-if (check.prepare('PRAGMA integrity_check').get().integrity_check !== 'ok') throw new Error('백업 무결성 검사 실패');
-console.log(`Backup verified: ${target}`); check.close();
+try { console.log(`Backup verified: ${await verifiedBackup(db, process.env.BACKUP_DIR || resolve(root, 'data/backups'))}`); }
+finally { db.close(); }

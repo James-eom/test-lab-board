@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { EQUIPMENT, DEFAULT_RULES, expandReservation, activeIntervals, validateInterval, supportsWeekend, canRunTogether } from './schedule.mjs';
+import { NATIONAL_HOLIDAYS, HOLIDAY_YEARS } from './holidays.mjs';
 
 export function fail(message, status = 400, code) { throw Object.assign(new Error(message), { status, code }); }
 const now = () => new Date().toISOString();
@@ -19,7 +20,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS actuals(reservationId TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS baselines(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS downtimes(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS automatic_plans(id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
   }
   transaction(fn) { this.db.exec('BEGIN IMMEDIATE'); try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (e) { this.db.exec('ROLLBACK'); throw e; } }
   users() { return this.db.prepare('SELECT id,login,name,role FROM users ORDER BY name').all(); }
@@ -32,11 +34,43 @@ export class Store {
     catch (e) { if (e.message.includes('UNIQUE')) fail('이미 등록된 아이디입니다.', 409); throw e; }
     return user;
   }
-  rules() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='rules'").get()) || DEFAULT_RULES; }
+  customHolidays() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='holidays'").get()) || []; }
+  holidayApiKey() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='holiday-api-key'").get()) || ''; }
+  saveHolidayApiKey(key) {
+    if (typeof key !== 'string' || key.trim().length < 20 || key.trim().length > 512 || /\s/.test(key.trim())) fail('인증키 형식을 확인해 주세요.');
+    try { key = decodeURIComponent(key.trim()); } catch { fail('인증키 인코딩을 확인해 주세요.'); }
+    if (/\s/.test(key) || key.length < 20) fail('인증키 형식을 확인해 주세요.');
+    this.db.prepare("INSERT INTO settings VALUES('holiday-api-key',?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(key));
+  }
+  holidayCache() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='holiday-cache'").get()) || {}; }
+  saveHolidayYear(year, holidays) {
+    const cache = this.holidayCache(); cache[year] = { holidays, updatedAt: now() };
+    this.db.prepare("INSERT INTO settings VALUES('holiday-cache',?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(cache));
+  }
+  holidayYears() { return [...new Set([...HOLIDAY_YEARS, ...Object.keys(this.holidayCache()).map(Number)])].sort((a, b) => a - b); }
+  rules() {
+    const cache = this.holidayCache(), holidays = new Map();
+    for (const h of [...this.customHolidays(), ...NATIONAL_HOLIDAYS.filter(h => !cache[h.date.slice(0, 4)]), ...Object.values(cache).flatMap(c => c.holidays)]) holidays.set(h.date, h);
+    return { ...(parse(this.db.prepare("SELECT payload FROM settings WHERE key='rules'").get()) || DEFAULT_RULES), holidays: [...holidays.values()] };
+  }
+  saveHoliday(input) {
+    const date = input.date, name = text(input.name, 80);
+    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date || !name) fail('공휴일 날짜와 이름을 확인해 주세요.');
+    if (this.rules().holidays.some(h => h.date === date)) fail('이미 등록된 공휴일입니다.', 409);
+    const holiday = { date, name, source: 'custom' };
+    this.db.prepare("INSERT INTO settings VALUES('holidays',?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload").run(JSON.stringify([...this.customHolidays(), holiday]));
+    return holiday;
+  }
+  removeHoliday(date) {
+    if (!this.customHolidays().some(h => h.date === date)) fail('추가 등록한 공휴일만 삭제할 수 있습니다.', 404);
+    this.db.prepare("UPDATE settings SET payload=? WHERE key='holidays'").run(JSON.stringify(this.customHolidays().filter(h => h.date !== date)));
+  }
   reservations() { return this.db.prepare('SELECT payload FROM reservations').all().map(parse).sort((a, b) => a.start.localeCompare(b.start)); }
   reservation(id) { return parse(this.db.prepare('SELECT payload FROM reservations WHERE id=?').get(id)); }
   saveReservation(input, userId, id) {
-    return this.transaction(() => {
+    return this.transaction(() => this.writeReservation(input, userId, id));
+  }
+  writeReservation(input, userId, id) {
       const old = id ? this.reservation(id) : null;
       if (id && !old) fail('예약을 찾을 수 없습니다.', 404);
       if (old && input.version !== old.version) fail('다른 팀원이 변경했습니다. 최신 내용을 다시 확인해 주세요.', 409);
@@ -49,12 +83,16 @@ export class Store {
       if (!this.users().some(u => u.id === input.ownerId)) fail('담당자를 선택해 주세요.');
       if (!['계획', '진행', '완료', '취소'].includes(input.status)) fail('상태를 확인해 주세요.');
       const r = { id: id || randomUUID(), equipmentId: e.id, testType: input.testType, title: text(input.title, 160), project: text(input.project || '', 100), ownerId: input.ownerId,
-        start: new Date(input.start).toISOString(), end: new Date(input.end).toISOString(), includeWeekend: input.includeWeekend === true, status: input.status, note: text(input.note || '', 2000), version: (old?.version || 0) + 1, createdAt: old?.createdAt || now(), updatedAt: now() };
+        start: new Date(input.start).toISOString(), end: new Date(input.end).toISOString(), includeWeekend: input.includeWeekend === true, status: input.status, note: text(input.note || '', 2000), version: (old?.version || 0) + 1, createdAt: old?.createdAt || now(), updatedAt: now(), ...(old?.automaticPlan ? { automaticPlan: old.automaticPlan } : {}) };
       if (!r.title) fail('시험명을 입력해 주세요.');
-      const intervals = expandReservation(r, this.rules());
+      const unchangedPeriod = old && old.equipmentId === r.equipmentId && old.testType === r.testType && old.start === r.start && old.end === r.end && (old.includeWeekend === true) === r.includeWeekend;
+      let intervals;
+      try { intervals = expandReservation(r, this.rules(), { validateOperatingDays: !unchangedPeriod }); }
+      catch (e) { fail(e.message); }
       if (old && this.db.prepare('SELECT 1 FROM actuals WHERE reservationId=?').get(id) && (r.start !== old.start || r.end !== old.end || r.equipmentId !== old.equipmentId || r.testType !== old.testType || r.includeWeekend !== (old.includeWeekend === true) || r.status === '취소')) fail('실적이 등록된 시험은 기간·설비·종류·주말 포함 변경이나 취소 전에 실적을 확인해 주세요.', 409);
       if (r.status !== '취소') for (const i of intervals) {
-        const overlaps = this.db.prepare('SELECT DISTINCT r.payload FROM intervals i JOIN reservations r ON r.id=i.reservationId WHERE i.equipmentId=? AND i.start<? AND i.end>? AND i.reservationId<>?').all(r.equipmentId, i.end, i.start, r.id).map(parse);
+        // Recompute with current holidays so additions/removals cannot leave stale conflicts.
+        const overlaps = this.reservations().filter(other => other.id !== r.id && other.equipmentId === r.equipmentId && other.status !== '취소' && expandReservation(other, this.rules(), { validateOperatingDays: false }).some(part => part.start < i.end && part.end > i.start));
         if (overlaps.some(other => !canRunTogether(r, other))) fail('같은 설비에 중복 예약이 있습니다.', 409, 'DUPLICATE_BOOKING');
         if (this.downtimes().some(d => d.equipmentId === r.equipmentId && d.start < i.end && d.end > i.start)) fail('설비 정지 일정과 겹칩니다.', 409);
       }
@@ -63,6 +101,18 @@ export class Store {
       if (r.status !== '취소') for (const i of intervals) this.db.prepare('INSERT INTO intervals VALUES(?,?,?,?)').run(r.id, r.equipmentId, i.start, i.end);
       this.db.prepare('INSERT INTO history(reservationId,payload) VALUES(?,?)').run(r.id, JSON.stringify({ before: old, after: r, ...(!old ? { plannedIntervals: activeIntervals(r, this.rules()) } : {}), reason: text(input.reason || '최초 등록', 500), userId, at: now() }));
       return r;
+  }
+  scheduleDeletionPreview() {
+    const tables = ['intervals', 'actuals', 'history', 'baselines', 'automatic_plans', 'reservations'];
+    const snapshot = Object.fromEntries(tables.map(table => [table, this.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+    return { counts: Object.fromEntries(tables.map(table => [table, snapshot[table].length])), revision: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex') };
+  }
+  deleteAllSchedules(revision) {
+    return this.transaction(() => {
+      const preview = this.scheduleDeletionPreview();
+      if (revision !== preview.revision) fail('시험 데이터가 변경되었습니다. 삭제 대상을 다시 확인해 주세요.', 409, 'STALE_DELETION');
+      for (const table of Object.keys(preview.counts)) this.db.exec(`DELETE FROM ${table}`);
+      return preview.counts;
     });
   }
   history(id) { return this.db.prepare('SELECT payload FROM history WHERE reservationId=? ORDER BY seq').all(id).map(parse); }
@@ -86,7 +136,8 @@ export class Store {
       validateInterval(input.start, input.end);
       actual.start = new Date(input.start).toISOString(); actual.end = new Date(input.end).toISOString();
       if (actual.start < r.start || actual.end > r.end) fail('실적 기간은 예약 기간 안으로 입력해 주세요.');
-      expandReservation({ ...r, ...actual }, this.rules());
+      // Actual activity is evidence, even when a holiday is registered later.
+      expandReservation({ ...r, ...actual }, { ...this.rules(), holidays: [] });
     } else if (!actual.note) fail('0시간 실적의 사유를 입력해 주세요.');
     this.db.prepare('INSERT INTO actuals VALUES(?,?) ON CONFLICT(reservationId) DO UPDATE SET payload=excluded.payload').run(r.id, JSON.stringify(actual));
     return actual;
@@ -111,7 +162,7 @@ export class Store {
   saveRules(input) {
     const r = { days: input.days, open: input.open, close: input.close, breaks: input.breaks };
     if (!Array.isArray(r.days) || !r.days.length || r.days.some(d => !Number.isInteger(d) || d < 0 || d > 6) || !Number.isInteger(r.open) || !Number.isInteger(r.close) || r.open < 0 || r.close > 1440 || r.open >= r.close || r.open % 30 || r.close % 30 || !Array.isArray(r.breaks) || r.breaks.length > 5 || r.breaks.some(i => !Array.isArray(i) || i.length !== 2 || i.some(v => !Number.isInteger(v) || v % 30) || i[0] < r.open || i[1] > r.close || i[0] >= i[1])) fail('운영일·시간·휴식을 확인해 주세요.');
-    for (const booking of this.reservations().filter(b => b.status !== '취소')) { try { expandReservation(booking, r); } catch { fail('기존 예약이 새 운영시간 밖에 있습니다. 해당 예약을 먼저 조정해 주세요.', 409); } }
+    for (const booking of this.reservations().filter(b => b.status !== '취소')) { try { expandReservation(booking, { ...r, holidays: this.rules().holidays }, { validateOperatingDays: false }); } catch { fail('기존 예약이 새 운영시간 밖에 있습니다. 해당 예약을 먼저 조정해 주세요.', 409); } }
     this.db.prepare("INSERT INTO settings VALUES('rules',?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(r)); return r;
   }
 }

@@ -17,12 +17,21 @@ const iso = value => new Date(value + ':00+09:00').toISOString();
 const statusClass = value => ({ 진행: 'running', 완료: 'complete', 취소: 'cancelled' })[value] || '';
 let me, csrf = '', setup = false, data, capa = [], page = 'schedule', mode = 'week', date = today(), refreshBusy = false;
 let search = '', owner = '', status = '', actualState = '';
+let range = null, rangeDraft = false, refreshQueued = false;
 const userName = id => data.users.find(u => u.id === id)?.name || '미지정';
 const equipmentName = id => data.equipment.find(e => e.id === id)?.name || id;
+const holidayName = day => data.rules.holidays.filter(h => h.date === day).map(h => h.name).join(' / ');
+function holidaySummary() {
+  const p = period(), operating = p.days.filter(d => data.rules.days.includes(weekday(d))), excluded = operating.filter(d => holidayName(d));
+  const unknown = [...new Set(p.days.map(d => Number(d.slice(0, 4))))].filter(y => !data.holidayYears.includes(y));
+  return `<div class="holiday-summary"><span>기본 가동일 ${operating.length - excluded.length}일 · 공휴일 제외 ${excluded.length}일 · 단품 대상내구 ${p.days.length}일</span>${p.days.length === 1 && holidayName(p.start) ? `<strong class="holiday-name">${esc(holidayName(p.start))}</strong>` : ''}${unknown.length ? `<span class="holiday-warning" role="status">${unknown.join(', ')}년 국가 공휴일 자료 미등록 — 가동일수·CAPA 확인 필요</span>` : ''}<small>국가 공휴일 자료: ${data.holidayYears.join('·')}년 · 공휴일 포함 기존 예약은 시험계획에서 확인</small></div>`;
+}
 function period() {
   let start = date, n = 1;
-  if (mode === 'week') { start = addDays(date, -((weekday(date) + 6) % 7)); n = 7; }
-  if (mode === 'month') { start = date.slice(0, 7) + '-01'; const d = new Date(start + 'T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + 1); n = Math.round((d.getTime() - new Date(start + 'T00:00:00Z').getTime()) / 86400000); }
+  if (range) { start = range.start; n = Math.round((Date.parse(range.end) - Date.parse(range.start)) / 86400000) + 1; }
+  else if (mode === 'year') { start = date.slice(0, 4) + '-01-01'; n = (Date.UTC(Number(date.slice(0, 4)) + 1, 0, 1) - Date.parse(start)) / 86400000; }
+  else if (mode === 'week') { start = addDays(date, -((weekday(date) + 6) % 7)); n = 7; }
+  else if (mode === 'month') { start = date.slice(0, 7) + '-01'; const d = new Date(start + 'T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + 1); n = Math.round((d.getTime() - new Date(start + 'T00:00:00Z').getTime()) / 86400000); }
   const end = addDays(start, n); return { start, end, days: Array.from({ length: n }, (_, i) => addDays(start, i)) };
 }
 function filtered() {
@@ -52,11 +61,18 @@ async function enter() {
   $('#auth-form').reset(); await refresh();
 }
 async function refresh() {
-  if (!me || refreshBusy) return;
+  if (!me) return;
+  if (refreshBusy) { refreshQueued = true; return; }
   refreshBusy = true;
-  try { data = await api('/api/state'); const p = period(); capa = await api(`/api/capacity?start=${encodeURIComponent(midnight(p.start))}&end=${encodeURIComponent(midnight(p.end))}`); $('#sync-status').textContent = '서버 연결됨'; $('#error-banner').classList.add('hidden'); render(); }
+  const p = period(), query = `start=${encodeURIComponent(midnight(p.start))}&end=${encodeURIComponent(midnight(p.end))}`;
+  try {
+    const nextData = await api('/api/state?' + query), nextCapa = await api('/api/capacity?' + query);
+    const current = period();
+    if (current.start !== p.start || current.end !== p.end) { refreshQueued = true; return; }
+    data = nextData; capa = nextCapa; $('#sync-status').textContent = '서버 연결됨'; $('#error-banner').classList.add('hidden'); render();
+  }
   catch (e) { error(e.message); $('#sync-status').textContent = '연결 확인 필요'; }
-  finally { refreshBusy = false; }
+  finally { refreshBusy = false; if (refreshQueued) { refreshQueued = false; void refresh(); } }
 }
 function render() {
   if (!data || !me) return;
@@ -65,7 +81,13 @@ function render() {
   document.querySelectorAll('.nav').forEach(b => b.classList.toggle('active', b.dataset.page === page));
   document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('selected', b.dataset.mode === mode));
   $('#date-picker').value = date;
-  const p = period(); $('#period-title').textContent = mode === 'month' ? `${date.slice(0, 4)}년 ${Number(date.slice(5, 7))}월` : mode === 'day' ? `${Number(date.slice(5, 7))}월 ${Number(date.slice(8))}일 (${daysLabel[weekday(date)]})` : `${Number(p.start.slice(5, 7))}월 ${Number(p.start.slice(8))}일 – ${Number(addDays(p.end, -1).slice(5, 7))}월 ${Number(addDays(p.end, -1).slice(8))}일`;
+  const p = period(); $('#period-title').textContent = range ? `${p.start} ~ ${addDays(p.end, -1)}` : mode === 'year' ? `${date.slice(0, 4)}년` : mode === 'month' ? `${date.slice(0, 4)}년 ${Number(date.slice(5, 7))}월` : mode === 'day' ? `${Number(date.slice(5, 7))}월 ${Number(date.slice(8))}일 (${daysLabel[weekday(date)]})` : `${Number(p.start.slice(5, 7))}월 ${Number(p.start.slice(8))}일 – ${Number(addDays(p.end, -1).slice(5, 7))}월 ${Number(addDays(p.end, -1).slice(8))}일`;
+  $('#period-title').classList.toggle('saturday', p.days.length === 1 && weekday(p.start) === 6 && !holidayName(p.start));
+  $('#period-title').classList.toggle('sunday', p.days.length === 1 && (weekday(p.start) === 0 || !!holidayName(p.start)));
+  if (!rangeDraft) { $('#range-start').value = p.start; $('#range-end').value = addDays(p.end, -1); }
+  $('#range-status').textContent = range ? `기간 검색 적용 중 · 종료일 포함 ${p.days.length}일` : '종료일 포함 · 최대 10년 조회';
+  $('#range-form').classList.toggle('applied', !!range);
+  $('#search').value = search;
   $('#owner-filter').innerHTML = '<option value="">모든 담당자</option>' + data.users.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join(''); $('#owner-filter').value = owner;
   const selected = filtered().filter(r => r.status !== '취소');
   const available = capa.reduce((sum, c) => sum + c.availableMinutes, 0), planned = capa.reduce((sum, c) => sum + c.plannedMinutes, 0);
@@ -76,7 +98,7 @@ function render() {
   ].map(([label, v, unit, note, i, emphasis], index) => `<button class="metric" data-summary="${['equipment', 'tests', 'occupancy', 'missing'][index]}" type="button"><span class="metric-label">${icon(i)}${label}</span><span class="metric-value ${emphasis ? 'emphasis' : ''}">${v}<span>${unit}</span></span><span class="metric-note">${note}</span></button>`).join('');
   $('#new-test').classList.toggle('hidden', ['history', 'settings'].includes(page));
   $('.filter-bar').classList.toggle('hidden', ['capacity', 'history', 'settings'].includes(page));
-  $('#content').innerHTML = page === 'schedule' ? scheduleView() : page === 'tests' ? testsView() : page === 'capacity' ? capacityView() : page === 'history' ? historyView() : settingsView();
+  $('#content').innerHTML = page === 'schedule' ? scheduleView() : page === 'tests' ? testsView() : page === 'capacity' ? capacityView() : page === 'history' ? historyView() : settingsView() + holidaySettings() + scheduleDeleteSettings();
   $('#footer-status').textContent = `동기화 ${new Date().toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour12: false })}`;
   icons();
 }
@@ -91,11 +113,16 @@ function booking(r, interval, day) {
   const label = !actual ? '실적 미입력' : actual.zero ? '실적 0시간' : parts.length ? '실적 ' + parts.map(p => `${p.start}~${p.end}`).join(' / ') : '당일 실적 없음';
   const actualContent = actual && !actual.zero && parts.length ? `<span class="actual-caption">실적</span> ${parts.map(p => clockRange(p.start, p.end)).join(' / ')}` : esc(label);
   const projectLabel = actual ? `<strong class="actual-project">${esc(r.project || r.title)}</strong>` : '';
-  return `<div class="booking-entry" data-detail="${r.id}"><button class="booking ${statusClass(r.status)}" data-detail="${r.id}"><span class="time"><span class="plan-caption">계획</span> ${clockRange(timeText(interval.start), timeText(interval.end))}</span><strong>${esc(r.title)}</strong><small>${esc(userName(r.ownerId))}${r.project ? ' · ' + esc(r.project) : ''}</small></button><div class="booking-actual ${!actual ? 'pending' : actual.zero ? 'zero' : ''}" title="${esc(actual ? (r.project || r.title) + ' · ' + label : label)}">${projectLabel}<span class="actual-value">${actualContent}</span></div></div>`;
+  return `<div class="booking-entry" data-detail="${r.id}"><button class="booking ${statusClass(r.status)}" data-detail="${r.id}"><span class="time"><span class="plan-caption">${interval.excluded ? '공휴일 계획 제외' : '계획'}</span> ${clockRange(timeText(interval.start), timeText(interval.end))}</span><strong>${esc(r.title)}</strong><small>${esc(userName(r.ownerId))}${r.project ? ' · ' + esc(r.project) : ''}</small></button><div class="booking-actual ${!actual ? 'pending' : actual.zero ? 'zero' : ''}" title="${esc(actual ? (r.project || r.title) + ' · ' + label : label)}">${projectLabel}<span class="actual-value">${actualContent}</span></div></div>`;
 }
 function dayEntries(e, day) {
   const a = new Date(midnight(day)).getTime(), b = a + 86400000;
-  return filtered().filter(r => r.equipmentId === e.id && (status === '취소' || r.status !== '취소')).flatMap(r => r.intervals.filter(i => new Date(i.start).getTime() < b && new Date(i.end).getTime() > a).map(i => ({ r, i: { start: new Date(Math.max(a, new Date(i.start).getTime())).toISOString(), end: new Date(Math.min(b, new Date(i.end).getTime())).toISOString() } })));
+  const onDay = i => new Date(i.start).getTime() < b && new Date(i.end).getTime() > a;
+  return filtered().filter(r => r.equipmentId === e.id && (status === '취소' || r.status !== '취소')).flatMap(r => {
+    let intervals = r.intervals.filter(onDay);
+    if (!intervals.length && holidayName(day)) intervals = (data.actuals.find(actual => actual.reservationId === r.id)?.intervals || []).filter(onDay).map(i => ({ ...i, excluded: true }));
+    return intervals.map(i => ({ r, i: { ...i, start: new Date(Math.max(a, new Date(i.start).getTime())).toISOString(), end: new Date(Math.min(b, new Date(i.end).getTime())).toISOString() } }));
+  });
 }
 function equipmentComparison(id) {
   const c = capa.find(c => c.id === id); if (!c) return '';
@@ -103,46 +130,119 @@ function equipmentComparison(id) {
   return `<div class="equipment-comparison"><dl><div><dt>최초 계획</dt><dd>${c.originalPlanMinutes === null ? '—' : hours(c.originalPlanMinutes) + ' h'}</dd></div><div><dt>실적${c.originalMissingActuals ? ' (입력분)' : ''}</dt><dd>${hours(c.actualMinutes)} h</dd></div><div><dt>달성률${c.originalMissingActuals ? ' (잠정)' : ''}</dt><dd>${percent}</dd></div></dl>${c.originalMissingActuals ? `<span class="comparison-pending">미입력 ${c.originalMissingActuals}건</span>` : ''}${c.unknownOriginalPlans ? `<span class="comparison-pending">최초 계획 확인 필요 ${c.unknownOriginalPlans}건</span>` : ''}</div>`;
 }
 function scheduleView() {
-  const p = period(), daily = mode === 'day';
+  const p = period();
+  if (mode === 'year' || (range && p.days.length > 31)) return annualView();
+  const daily = mode === 'day' && p.days.length === 1;
   const columns = daily ? Array.from({ length: 48 }, (_, i) => i * 30) : p.days;
-  const head = columns.map(c => daily ? `<th><strong>${String(Math.floor(c / 60)).padStart(2, '0')}:${String(c % 60).padStart(2, '0')}</strong></th>` : `<th class="${c === today() ? 'current' : ''}">${daysLabel[weekday(c)]}<strong>${Number(c.slice(8))}</strong></th>`).join('');
+  const head = columns.map(c => daily ? `<th><strong>${String(Math.floor(c / 60)).padStart(2, '0')}:${String(c % 60).padStart(2, '0')}</strong></th>` : `<th class="${c === today() ? 'current' : ''} ${weekday(c) === 6 ? 'saturday' : weekday(c) === 0 ? 'sunday' : ''} ${holidayName(c) ? 'holiday' : ''}" title="${esc(holidayName(c))}">${daysLabel[weekday(c)]}<strong>${Number(c.slice(8))}</strong>${holidayName(c) ? `<small class="holiday-name">${esc(holidayName(c))}</small>` : ''}</th>`).join('');
   const rows = data.equipment.map(e => {
     const cells = columns.map(c => {
-      const day = daily ? date : c, entries = dayEntries(e, day);
-      const off = e.id !== 'endurance' && (!data.rules.days.includes(weekday(day)) || (daily && (c < data.rules.open || c >= data.rules.close || data.rules.breaks.some(([a, b]) => c >= a && c < b))));
+      const day = daily ? p.start : c, entries = dayEntries(e, day);
+      const holiday = holidayName(day);
+      const off = e.id !== 'endurance' && (holiday || !data.rules.days.includes(weekday(day)) || (daily && (c < data.rules.open || c >= data.rules.close || data.rules.breaks.some(([a, b]) => c >= a && c < b))));
       let contents;
       if (daily) {
         const start = new Date(midnight(day)).getTime() + c * 60000, end = start + 1800000;
         contents = entries.filter(({ i }) => new Date(i.start).getTime() < end && new Date(i.end).getTime() > start).map(({ r, i }) => booking(r, i, day)).join('');
       } else contents = entries.map(({ r, i }) => booking(r, i, day)).join('');
       const stop = data.downtimes.find(d => d.equipmentId === e.id && d.start < new Date(midnight(addDays(day, 1))).toISOString() && d.end > new Date(midnight(day)).toISOString());
-      return `<td class="day-cell ${off ? 'off' : ''} ${day === today() ? 'current' : ''}" data-slot="${e.id}" data-day="${day}" ${daily ? `data-minute="${c}"` : ''}>${contents || (stop ? `<span class="off-label">${esc(stop.reason)}</span>` : `<span class="${off ? 'off-label' : 'empty-slot'}">${off ? '비가동' : daily ? '' : '—'}</span>`)}</td>`;
+      return `<td class="day-cell ${off ? 'off' : ''} ${holiday ? 'holiday' : ''} ${day === today() ? 'current' : ''}" title="${esc(holiday)}" data-slot="${e.id}" data-day="${day}" ${daily ? `data-minute="${c}"` : ''}>${contents || (stop ? `<span class="off-label">${esc(stop.reason)}</span>` : `<span class="${off ? 'off-label' : 'empty-slot'}">${off ? holiday ? '공휴일' : '비가동' : daily ? '' : '—'}</span>`)}</td>`;
     }).join('');
     return `<tr><td class="equipment-cell"><span class="equipment-mark">${icon(e.id.startsWith('engine') ? 'settings' : e.id.startsWith('thermal') ? 'thermometer' : e.id === 'endurance' ? 'infinity' : 'wind')}</span><strong>${esc(e.name)}</strong><small>${e.id === 'endurance' ? '24시간 · 주말 연속' : e.id.startsWith('thermal') ? '시험 종류별 휴식 적용' : '평일 기준 · 주말 예약 가능'}</small>${equipmentComparison(e.id)}</td>${cells}</tr>`;
   }).join('');
-  return `<div class="schedule-scroll"><table class="schedule-table ${daily ? 'day-table' : mode === 'month' ? 'month-table' : ''}"><thead><tr><th class="equipment-cell">시험실 / 설비</th>${head}</tr></thead><tbody>${rows}</tbody></table></div><div class="grid-caption"><span>기본 가동 08:30~20:30 · 휴식 12:30~13:30 / 17:30~18:00</span><span>단품 대상내구: 야간·주말 포함 · 열가진: 시험별 기준</span></div>`;
+  return `${holidaySummary()}<div class="schedule-scroll"><table class="schedule-table ${daily ? 'day-table' : mode === 'month' ? 'month-table' : ''}"><thead><tr><th class="equipment-cell">시험실 / 설비</th>${head}</tr></thead><tbody>${rows}</tbody></table></div><div class="grid-caption"><span>기본 가동 08:30~20:30 · 휴식 12:30~13:30 / 17:30~18:00 · 공휴일 제외</span><span>단품 대상내구·SN 커브: 24시간 연속 · 성능시험·Glass Wool 내구: 기본 운영시간</span></div>`;
+}
+function annualView() {
+  const p = period(), selected = filtered().filter(r => r.status !== '취소'), byId = new Map(selected.map(r => [r.id, r]));
+  const days = new Map(p.days.map(d => [d, { plans: new Set(), actuals: new Set() }]));
+  const indexIntervals = (intervals, id, kind) => {
+    for (const i of intervals) {
+      const a = Math.max(Date.parse(i.start), Date.parse(midnight(p.start))), b = Math.min(Date.parse(i.end), Date.parse(midnight(p.end)));
+      if (b <= a) continue;
+      const last = dayOf(b - 1);
+      for (let d = dayOf(a); d <= last; d = addDays(d, 1)) days.get(d)?.[kind].add(id);
+    }
+  };
+  for (const r of selected) indexIntervals(r.intervals, r.id, 'plans');
+  for (const a of data.actuals.filter(a => byId.has(a.reservationId))) indexIntervals(a.intervals, a.reservationId, 'actuals');
+  const months = [...new Set(p.days.map(d => d.slice(0, 7)))];
+  const cards = months.map(month => {
+    const first = month + '-01', next = new Date(first + 'T00:00:00Z'); next.setUTCMonth(next.getUTCMonth() + 1);
+    const n = (next.getTime() - Date.parse(first)) / 86400000, activeDays = p.days.filter(d => d.startsWith(month));
+    const operating = activeDays.filter(d => data.rules.days.includes(weekday(d))), excluded = operating.filter(d => holidayName(d));
+    const tests = new Set(activeDays.flatMap(d => [...days.get(d).plans]));
+    const cells = Array.from({ length: 42 }, (_, position) => {
+      const number = position - weekday(first) + 1;
+      if (number < 1 || number > n) return '<span class="annual-blank" aria-hidden="true"></span>';
+      const day = `${month}-${String(number).padStart(2, '0')}`, entry = days.get(day), holiday = holidayName(day), week = weekday(day);
+      const planCount = entry?.plans.size || 0, actualCount = entry?.actuals.size || 0;
+      const names = entry ? [...new Set([...entry.plans, ...entry.actuals])].map(id => { const r = byId.get(id); return `${equipmentName(r.equipmentId)} · ${r.project || r.title} · ${r.status}`; }).join('\n') : '';
+      const label = `${day}, 시험 ${planCount}건, 실적 ${actualCount}건${holiday ? ', ' + holiday : ''}`;
+      return `<button type="button" class="annual-day ${week === 6 ? 'saturday' : week === 0 ? 'sunday' : ''} ${holiday ? 'holiday' : ''} ${planCount ? 'has-tests' : ''} ${day === today() ? 'current' : ''}" data-open-day="${day}" ${entry ? '' : 'disabled'} aria-label="${esc(label)}" title="${esc([day, holiday, names].filter(Boolean).join('\n'))}"><span>${number}</span><small>${planCount ? planCount + '건' : '&nbsp;'}</small>${actualCount ? `<span class="annual-actual" aria-hidden="true"></span>` : ''}</button>`;
+    }).join('');
+    return `<section class="annual-month" data-month="${month}"><div class="annual-month-heading"><button class="quiet" data-open-month="${month}" aria-label="${month.slice(0, 4)}년 ${Number(month.slice(5))}월 월간 보기"><strong>${month.slice(0, 4)}년 ${Number(month.slice(5))}월</strong>${icon('arrow-up-right')}</button><small>시험 ${tests.size}건</small></div><p>기본 가동 ${operating.length - excluded.length}일 · 공휴일 제외 ${excluded.length}일</p><div class="annual-weekdays">${daysLabel.map((d, i) => `<span class="${i === 6 ? 'saturday' : i === 0 ? 'sunday' : ''}">${d}</span>`).join('')}</div><div class="annual-days">${cells}</div>${activeDays.some(d => holidayName(d)) ? `<div class="annual-holidays">${activeDays.filter(d => holidayName(d)).map(d => `<span>${Number(d.slice(8))}일 ${esc(holidayName(d))}</span>`).join('')}</div>` : '<div class="annual-holidays">공휴일 없음</div>'}</section>`;
+  }).join('');
+  return `${holidaySummary()}<p class="muted">날짜를 누르면 일간 보기, 월 제목을 누르면 월간 보기로 이동합니다. 날짜별 시험 건수 · 초록 점은 실적 입력일${range ? ' · 조회 구간 밖 날짜는 비활성화' : ''}</p><div class="annual-grid">${cards}</div><div class="section-heading"><h2>${range ? '조회 구간' : '연간'} 설비별 가동현황</h2></div>${capacityView(false)}`;
 }
 function testsView() {
   const rows = filtered();
   if (!rows.length) return empty('등록된 시험이 없습니다.', '선택 기간과 검색 조건을 확인해 주세요.', true);
   return `<div class="table-wrap"><table class="data-table"><thead><tr><th>시험명 / 프로젝트</th><th>시험실</th><th>담당자</th><th>예약 기간</th><th>상태</th><th>실적</th><th></th></tr></thead><tbody>${rows.map(r => `<tr><td class="title-cell"><strong>${esc(r.title)}</strong><small>${esc(r.project || r.testType)}</small></td><td>${esc(equipmentName(r.equipmentId))}</td><td>${esc(userName(r.ownerId))}</td><td>${dateText(r.start)}<br><span class="muted">${dateText(r.end)}</span></td><td><span class="tag ${statusClass(r.status)}">${r.status}</span></td><td>${data.actuals.some(a => a.reservationId === r.id) ? '입력' : '<span class="muted">미입력</span>'}</td><td><button class="icon-button" data-detail="${r.id}" title="시험 상세" aria-label="시험 상세">${icon('arrow-up-right')}</button></td></tr>`).join('')}</tbody></table></div>`;
 }
-function capacityView() {
-  return `<div class="table-wrap"><table class="data-table capacity-table"><thead><tr><th>시험실</th><th>가용 시간</th><th>계획 가동</th><th>계획 점유율</th><th>실적 가동</th><th>실적 가동률</th></tr></thead><tbody>${capa.map(c => {
+function capacityView(showSummary = true) {
+  return `${showSummary ? holidaySummary() : ''}<div class="table-wrap"><table class="data-table capacity-table"><thead><tr><th>시험실</th><th>가용 시간</th><th>계획 가동</th><th>계획 점유율</th><th>실적 가동</th><th>실적 가동률</th></tr></thead><tbody>${capa.map(c => {
     const percent = c.availableMinutes ? c.plannedMinutes / c.availableMinutes * 100 : null;
     return `<tr><td><b>${esc(c.name)}</b><small>${c.id === 'endurance' ? '24시간 × 운영일 · 정지시간 제외' : c.id.startsWith('thermal') ? '기본 가용 + 연속시험 휴식 가동 · 정지 제외' : '평일 가용 + 주말 예약 가동 · 정지 제외'}</small></td><td><strong>${hours(c.availableMinutes)}</strong> h</td><td><strong>${hours(c.plannedMinutes)}</strong> h</td><td>${percent === null ? '—' : percent.toFixed(1) + '%'}<div class="bar"><span style="width:${Math.min(percent || 0, 100)}%"></span></div></td><td><strong>${hours(c.actualMinutes)}</strong> h<small>${c.missingActuals ? `미입력 ${c.missingActuals}건` : '입력 완료'}</small></td><td>${c.missingActuals ? '<span class="muted">미입력 포함 · 미확정</span>' : c.availableMinutes ? (c.actualMinutes / c.availableMinutes * 100).toFixed(1) + '%' : '—'}</td></tr>`;
   }).join('')}</tbody></table></div><div class="grid-caption"><span>시간 단위: h · 예약 점유와 실제 가동 시간은 구분됩니다.</span><span>가동실적은 입력된 시험 기준이며, 미입력은 자동 추정하지 않습니다.</span></div>`;
 }
 function historyView() {
-  const month = date.slice(0, 7), baselines = data.baselines.filter(b => b.month === month).reverse();
-  return `<div class="section-heading"><h2>${month.replace('-', '년 ')}월 기준계획</h2>${me.role === 'admin' ? `<button class="quiet" id="save-baseline">${icon('bookmark-plus')}현재 계획 확정</button>` : ''}</div>${baselines.length ? `<div class="baseline-list">${baselines.map(b => `<div class="baseline-item"><div><strong>${dateText(b.at)} 기준계획</strong><small>${esc(userName(b.userId))} · 시험 ${b.reservations.length}건</small></div><button class="quiet" data-baseline="${b.id}">변경 비교${icon('arrow-right')}</button></div>`).join('')}</div>` : empty('저장된 기준계획이 없습니다.', '관리자가 월간 계획 확정 시점에 기준계획을 저장할 수 있습니다.')}<div class="section-heading"><h2>시험별 변경 이력</h2></div>${testsView()}`;
+  const p = period(), month = p.start.slice(0, 7), last = addDays(p.end, -1).slice(0, 7), singleMonth = month === last;
+  const baselines = data.baselines.filter(b => b.month >= month && b.month <= last).reverse();
+  return `<div class="section-heading"><h2>${singleMonth ? month.replace('-', '년 ') + '월' : '조회 구간'} 기준계획</h2>${me.role === 'admin' && singleMonth ? `<button class="quiet" id="save-baseline">${icon('bookmark-plus')}현재 월 계획 확정</button>` : ''}</div>${!singleMonth ? '<p class="muted">기준계획 확정은 월간 보기에서 해당 월을 선택해 주세요.</p>' : ''}${baselines.length ? `<div class="baseline-list">${baselines.map(b => `<div class="baseline-item"><div><strong>${b.month} · ${dateText(b.at)} 기준계획</strong><small>${esc(userName(b.userId))} · 시험 ${b.reservations.length}건</small></div><button class="quiet" data-baseline="${b.id}">변경 비교${icon('arrow-right')}</button></div>`).join('')}</div>` : empty('저장된 기준계획이 없습니다.', '관리자가 월간 계획 확정 시점에 기준계획을 저장할 수 있습니다.')}<div class="section-heading"><h2>시험별 변경 이력</h2></div>${testsView()}`;
 }
 function settingsView() {
-  const r = data.rules;
+  const r = data.rules, p = period(), start = new Date(midnight(p.start)).toISOString(), end = new Date(midnight(p.end)).toISOString();
+  const stops = data.downtimes.filter(d => !range || (d.start < end && d.end > start));
   const clock = v => `${String(Math.floor(v / 60)).padStart(2, '0')}:${String(v % 60).padStart(2, '0')}`;
-  return `<section class="setting-band"><h3>기본 운영 기준</h3><p>${r.days.map(d => daysLabel[d]).join(' · ')}요일 / ${clock(r.open)}~${clock(r.close)}<br>휴식 ${r.breaks.map(([a, b]) => `${clock(a)}~${clock(b)}`).join(' / ')}<br>열가진 연속시험과 단품 대상내구는 별도 기준 적용</p>${me.role === 'admin' ? `<div class="inline-actions"><button class="quiet" id="edit-rules">${icon('sliders-horizontal')}운영 기준 수정</button><button class="quiet" id="add-downtime">${icon('wrench')}설비 정지 등록</button></div>` : ''}</section><div class="section-heading"><h2>팀 계정 <span class="muted">${data.users.length}/6</span></h2>${me.role === 'admin' && data.users.length < 6 ? `<button class="quiet" id="add-user">${icon('user-plus')}팀원 등록</button>` : ''}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>이름</th><th>아이디</th><th>권한</th></tr></thead><tbody>${data.users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.login)}</td><td>${u.role === 'admin' ? '관리자' : '팀원'}</td></tr>`).join('')}</tbody></table></div><div class="section-heading"><h2>설비 정지 일정</h2></div>${data.downtimes.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>시험실</th><th>기간</th><th>사유</th><th></th></tr></thead><tbody>${data.downtimes.map(d => `<tr><td>${esc(equipmentName(d.equipmentId))}</td><td>${dateText(d.start)}~${dateText(d.end)}</td><td>${esc(d.reason)}</td><td>${me.role === 'admin' ? `<button class="icon-button" data-remove-downtime="${d.id}" title="정지 일정 삭제" aria-label="정지 일정 삭제">${icon('trash-2')}</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : empty('설비 정지 일정이 없습니다.', '')}`;
+  return `<section class="setting-band"><h3>기본 운영 기준</h3><p>${r.days.map(d => daysLabel[d]).join(' · ')}요일 / ${clock(r.open)}~${clock(r.close)}<br>휴식 ${r.breaks.map(([a, b]) => `${clock(a)}~${clock(b)}`).join(' / ')}<br>열가진 연속시험과 단품 대상내구는 별도 기준 적용</p>${me.role === 'admin' ? `<div class="inline-actions"><button class="quiet" id="edit-rules">${icon('sliders-horizontal')}운영 기준 수정</button><button class="quiet" id="add-downtime">${icon('wrench')}설비 정지 등록</button></div>` : ''}</section><div class="section-heading"><h2>팀 계정 <span class="muted">${data.users.length}/6</span></h2>${me.role === 'admin' && data.users.length < 6 ? `<button class="quiet" id="add-user">${icon('user-plus')}팀원 등록</button>` : ''}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>이름</th><th>아이디</th><th>권한</th></tr></thead><tbody>${data.users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.login)}</td><td>${u.role === 'admin' ? '관리자' : '팀원'}</td></tr>`).join('')}</tbody></table></div><div class="section-heading"><h2>${range ? '조회 구간 ' : ''}설비 정지 일정</h2></div>${stops.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>시험실</th><th>기간</th><th>사유</th><th></th></tr></thead><tbody>${stops.map(d => `<tr><td>${esc(equipmentName(d.equipmentId))}</td><td>${dateText(d.start)}~${dateText(d.end)}</td><td>${esc(d.reason)}</td><td>${me.role === 'admin' ? `<button class="icon-button" data-remove-downtime="${d.id}" title="정지 일정 삭제" aria-label="정지 일정 삭제">${icon('trash-2')}</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : empty('설비 정지 일정이 없습니다.', '')}`;
 }
 function empty(title, subtitle, add = false) { return `<div class="empty-state">${icon('calendar-days')}<h3>${title}</h3><p>${subtitle}</p>${add ? `<button class="quiet" data-add>${icon('plus')}시험 등록</button>` : ''}</div>`; }
+function holidaySettings() {
+  const year = date.slice(0, 4), p = period(), holidays = data.rules.holidays.filter(h => range ? h.date >= p.start && h.date < p.end : h.date.startsWith(year)).sort((a, b) => a.date.localeCompare(b.date));
+  const sync = data.holidaySync;
+  const unknown = [...new Set((range ? p.days : [date]).map(d => Number(d.slice(0, 4))))].filter(y => !data.holidayYears.includes(y));
+  return `<section class="setting-band" id="holiday-sync-status"><h3>공휴일 자동 갱신</h3><p>${sync.configured ? '인증키 등록됨 · 자동 갱신 설정됨' : '인증키 미등록 · 내장 공휴일 자료 사용'}<br>서버 시작 시 확인 · 이후 6시간마다 확인하여 24시간 지난 자료 갱신 · 조회 실패 시 기존 자료 유지</p>${sync.years.map(y => `<p>${y.year}년 공식 자료 ${y.count}일 · 마지막 갱신 ${esc(new Date(y.updatedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }))}</p>`).join('')}${sync.errors.map(e => `<p class="holiday-warning" role="status">${e.year}년: ${esc(e.message)}</p>`).join('')}${me.role === 'admin' ? `<div class="inline-actions"><button class="quiet" id="holiday-api-key">${sync.configured ? '인증키 변경' : '인증키 등록'}</button><button class="quiet" id="sync-holidays" ${sync.configured ? '' : 'disabled'}>지금 갱신</button></div>` : ''}</section>
+    <div class="section-heading"><h2>${range ? '조회 구간' : year + '년'} 공휴일</h2>${me.role === 'admin' ? '<button class="quiet" id="add-holiday">공휴일 추가</button>' : ''}</div>
+    <p class="muted">공휴일 자료 적용 연도: ${data.holidayYears.join('·')}년. 임시공휴일은 관리자가 추가할 수 있습니다. 일반 설비의 계획·CAPA에서 제외하며 주말 포함을 선택해도 공휴일은 제외합니다. 기존 실적과 최초 계획은 보존합니다.</p>
+    ${unknown.length ? `<p class="holiday-warning">${unknown.join(', ')}년 국가 공휴일 자료가 없습니다. 추가 등록한 날짜만 적용됩니다.</p>` : ''}
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>날짜</th><th>공휴일</th><th>자료</th><th></th></tr></thead><tbody>${holidays.map(h => `<tr><td>${h.date}</td><td>${esc(h.name)}</td><td>${h.source === 'api' ? '한국천문연구원 API' : h.source === 'national' ? '내장 국가 공휴일' : '추가 등록'}</td><td>${me.role === 'admin' && data.customHolidays.some(c => c.date === h.date) ? `<button class="quiet" data-remove-holiday="${h.date}">추가 등록 삭제</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function scheduleDeleteSettings() {
+  return me.role === 'admin' ? `<section class="setting-band"><h3>전체 시험 일정 일괄 삭제</h3><p>조회 기간·검색 조건과 관계없이 모든 시험 예약(취소 포함), 실적, 변경 이력, 기준계획, 과거 자동 배치 내역을 삭제합니다.<br>계정·운영 설정·공휴일·설비 정지 일정은 유지됩니다. 삭제 전 서버에 전체 DB 백업을 저장합니다.</p><button class="quiet" id="delete-all-schedules">${icon('trash-2')}전체 시험 일정 삭제…</button></section>` : '';
+}
+async function scheduleDeleteForm() {
+  const preview = await api('/api/schedules/deletion-preview'), c = preview.counts;
+  modal('전체 시험 일정 삭제', `<form id="delete-schedules-form"><p class="warning-note">모든 기간·모든 시험실이 대상입니다. 예약 ${c.reservations}건 · 실적 ${c.actuals}건 · 변경 이력 ${c.history}건 · 기준계획 ${c.baselines}건 · 과거 자동 배치 ${c.automatic_plans}건을 삭제합니다.</p><p>계정·운영 설정·공휴일·설비 정지 일정은 유지됩니다. 백업 실패 시 삭제하지 않습니다. 복구하려면 서버 관리자가 백업 DB를 복원해야 합니다.</p><label>확인 문구: 전체 시험 일정 삭제<input name="confirmation" autocomplete="off" required></label><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>취소</button><button type="submit" class="primary" disabled>백업 후 전체 삭제</button></div></form>`);
+  const form = $('#delete-schedules-form'), submit = form.querySelector('[type=submit]');
+  form.elements.confirmation.oninput = () => { submit.disabled = form.elements.confirmation.value !== '전체 시험 일정 삭제'; };
+  form.onsubmit = async event => {
+    event.preventDefault(); submit.disabled = true;
+    try {
+      const result = await api('/api/schedules', 'DELETE', { confirmation: form.elements.confirmation.value, revision: preview.revision });
+      $('#modal').close(); await refresh();
+      modal('전체 시험 일정 삭제 완료', `<p>시험 예약 ${result.deleted.reservations}건과 연결된 데이터를 삭제했습니다.</p><p>서버 백업 파일: <strong>${esc(result.backupFile)}</strong></p><p>백업에는 계정과 API 인증키가 포함되어 있으므로 외부에 공유하지 마세요. 복구는 서버에서 DB 복원으로 진행합니다.</p><button class="quiet" data-close>닫기</button>`);
+    } catch (e) { form.querySelector('.error').textContent = e.message; }
+    finally { submit.disabled = form.elements.confirmation.value !== '전체 시험 일정 삭제'; }
+  };
+}
+function holidayKeyForm() {
+  modal('공휴일 API 인증키 등록', `<form id="holiday-key-form"><p class="warning-note">공공데이터포털의 한국천문연구원 특일 정보 인증키를 입력합니다. 서버 데이터베이스에 저장하며 화면에 다시 표시하지 않습니다.</p><div class="form-grid"><label class="full">인증키<input name="key" type="password" autocomplete="off" minlength="20" maxlength="512" required></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">인증키 저장</button></div></form>`);
+  const form = $('#holiday-key-form'); form.onsubmit = event => { event.preventDefault(); const key = form.elements.key.value; saveForm(form, () => api('/api/holidays/key', 'POST', { key }), '인증키를 저장했습니다. 갱신 상태를 확인해 주세요.'); };
+}
+function holidayForm() {
+  modal('공휴일 추가', `<form id="holiday-form"><p class="warning-note">일반 설비의 해당 날짜 계획과 CAPA에서 제외됩니다. 기존 예약·실적·최초 계획 이력은 보존됩니다.</p><div class="form-grid"><label>날짜<input name="date" type="date" value="${date}" required></label><label>공휴일 이름<input name="name" maxlength="80" required placeholder="임시공휴일"></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">공휴일 저장</button></div></form>`);
+  const form = $('#holiday-form'); form.onsubmit = event => { event.preventDefault(); saveForm(form, () => api('/api/holidays', 'POST', Object.fromEntries(new FormData(form))), '공휴일을 추가했습니다.'); };
+}
 function modal(title, html) { $('#modal-title').textContent = title; $('#modal-body').innerHTML = html; if (!$('#modal').open) $('#modal').showModal(); icons(); }
 function option(value, label, selected) { return `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`; }
 function reservationForm(r, equipmentId, day, minute) {
@@ -154,6 +254,11 @@ function reservationForm(r, equipmentId, day, minute) {
   const end = r ? local(r.end) : local(new Date(new Date(start + ':00+09:00').getTime() + 3600000));
   modal(r ? '시험계획 수정' : '시험 등록', `<form id="reservation-form" data-id="${r?.id || ''}"><div class="form-grid"><label class="full">차종 / 프로젝트<input name="project" value="${esc(r?.project || '')}" maxlength="100"></label><label>시험실<select name="equipmentId">${data.equipment.map(e => option(e.id, e.name, eq)).join('')}</select></label><label>시험 종류<select name="testType"></select></label><label class="full">담당자<select name="ownerId">${data.users.map(u => option(u.id, u.name, r?.ownerId || me.id)).join('')}</select></label><label>시작 일시<input name="start" type="datetime-local" step="1800" value="${start}" required></label><label>종료 일시<input name="end" type="datetime-local" step="1800" value="${end}" required></label><label class="full checkbox-label"><input type="checkbox" name="includeWeekend" ${r?.includeWeekend ? 'checked' : ''}>주말 포함</label><label>상태<select name="status">${['계획', '진행', '완료', '취소'].map(s => option(s, s, r?.status || '계획')).join('')}</select></label>${r ? '<label>변경 사유<input name="reason" required maxlength="500"></label>' : ''}<label class="full">비고<textarea name="note" maxlength="2000">${esc(r?.note || '')}</textarea></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">${icon('check')}저장</button></div></form>`);
   const form = $('#reservation-form'), typeSelect = form.elements.testType;
+  form.querySelector('.error').insertAdjacentHTML('beforebegin', '<p class="muted" id="reservation-operating-rule"></p>');
+  const syncOperatingRule = () => {
+    const continuous = form.elements.equipmentId.value === 'endurance' && typeSelect.value !== '성능시험';
+    $('#reservation-operating-rule').textContent = continuous ? '연속 24시간 가동: 야간·주말·공휴일 포함' : `기본 운영시간 적용 · 운영일만 예약 · 공휴일 제외${['열피로 시험', '열충격 시험', '열피로/열충격 시험'].includes(typeSelect.value) ? ' · 휴식시간 연속 가동' : ' · 휴식시간 제외'}`;
+  };
   const weekendLabel = form.elements.includeWeekend.closest('label');
   const syncWeekend = () => {
     const supported = supportsWeekend(form.elements.equipmentId.value), checkbox = form.elements.includeWeekend;
@@ -166,7 +271,8 @@ function reservationForm(r, equipmentId, day, minute) {
     if (r?.equipmentId === equipment.id && !types.includes(r.testType)) types.push(r.testType);
     typeSelect.innerHTML = types.map(t => option(t, equipment.types.includes(t) ? t : t + ' (기존 예약)', r?.testType)).join('');
   };
-  setTypes(); syncWeekend(); form.elements.equipmentId.onchange = () => { setTypes(); syncWeekend(); };
+  setTypes(); syncWeekend(); syncOperatingRule(); typeSelect.onchange = syncOperatingRule;
+  form.elements.equipmentId.onchange = () => { setTypes(); syncWeekend(); syncOperatingRule(); };
   form.elements.start.onchange = syncWeekend; form.elements.end.onchange = syncWeekend;
   form.onsubmit = async event => { event.preventDefault(); syncWeekend(); const values = Object.fromEntries(new FormData(form)); values.title = values.testType; values.includeWeekend = !form.elements.includeWeekend.disabled && form.elements.includeWeekend.checked; values.start = iso(values.start); values.end = iso(values.end); if (r) values.version = r.version;
     await saveForm(form, () => api('/api/reservations' + (r ? '/' + r.id : ''), r ? 'PUT' : 'POST', values), '시험계획을 저장했습니다.'); };
@@ -180,7 +286,7 @@ async function saveForm(form, operation, message) {
 async function detail(id) {
   const r = data.reservations.find(r => r.id === id); if (!r) return;
   const hist = await api(`/api/reservations/${r.id}/history`), a = data.actuals.find(a => a.reservationId === r.id);
-  modal('시험 상세', `<dl class="detail-grid"><div class="full"><dt>시험명</dt><dd><strong>${esc(r.title)}</strong></dd></div><div><dt>시험실</dt><dd>${esc(equipmentName(r.equipmentId))}</dd></div><div><dt>시험 종류</dt><dd>${esc(r.testType)}</dd></div><div><dt>담당자</dt><dd>${esc(userName(r.ownerId))}</dd></div><div><dt>상태</dt><dd><span class="tag ${statusClass(r.status)}">${r.status}</span></dd></div><div class="full"><dt>예약 기간</dt><dd>${dateText(r.start)} ~ ${dateText(r.end)}</dd></div><div class="full"><dt>주말 포함</dt><dd>${r.includeWeekend ? '포함' : r.equipmentId === 'endurance' ? '연속 가동' : '기본 운영일'}</dd></div><div class="full"><dt>가동실적</dt><dd>${!a ? '미입력' : a.zero ? '0시간 · ' + esc(a.note) : dateText(a.start) + ' ~ ' + dateText(a.end)}</dd></div>${r.note ? `<div class="full"><dt>비고</dt><dd>${esc(r.note)}</dd></div>` : ''}</dl><div class="inline-actions"><button class="quiet" data-edit="${r.id}">${icon('pencil')}계획 수정</button>${r.status !== '취소' ? `<button class="primary" data-actual="${r.id}">${icon('timer')}실적 입력</button>` : ''}${a ? `<button class="quiet danger" data-remove-actual="${r.id}">${icon('trash-2')}실적 삭제</button>` : ''}</div><div class="section-heading"><h2>변경 이력</h2></div>${hist.reverse().map(h => `<div class="history-item"><strong>${esc(h.reason)}</strong><small>${dateText(h.at)} · ${esc(userName(h.userId))}</small><p>${h.before ? `${dateText(h.before.start)} ~ ${dateText(h.before.end)} / ${esc(h.before.status)} →<br>` : '최초 계획: '}${dateText(h.after.start)} ~ ${dateText(h.after.end)} / ${esc(h.after.status)}</p></div>`).join('')}`);
+  modal('시험 상세', `<dl class="detail-grid"><div class="full"><dt>시험명</dt><dd><strong>${esc(r.title)}</strong></dd></div><div><dt>시험실</dt><dd>${esc(equipmentName(r.equipmentId))}</dd></div><div><dt>시험 종류</dt><dd>${esc(r.testType)}</dd></div><div><dt>담당자</dt><dd>${esc(userName(r.ownerId))}</dd></div><div><dt>상태</dt><dd><span class="tag ${statusClass(r.status)}">${r.status}</span></dd></div><div class="full"><dt>예약 기간</dt><dd>${dateText(r.start)} ~ ${dateText(r.end)}</dd></div><div class="full"><dt>주말 포함</dt><dd>${r.includeWeekend ? '포함' : r.equipmentId === 'endurance' && r.testType !== '성능시험' ? '연속 가동' : '기본 운영일'}</dd></div><div class="full"><dt>가동실적</dt><dd>${!a ? '미입력' : a.zero ? '0시간 · ' + esc(a.note) : dateText(a.start) + ' ~ ' + dateText(a.end)}</dd></div>${r.note ? `<div class="full"><dt>비고</dt><dd>${esc(r.note)}</dd></div>` : ''}</dl><div class="inline-actions"><button class="quiet" data-edit="${r.id}">${icon('pencil')}계획 수정</button>${r.status !== '취소' ? `<button class="primary" data-actual="${r.id}">${icon('timer')}실적 입력</button>` : ''}${a ? `<button class="quiet danger" data-remove-actual="${r.id}">${icon('trash-2')}실적 삭제</button>` : ''}</div><div class="section-heading"><h2>변경 이력</h2></div>${hist.reverse().map(h => `<div class="history-item"><strong>${esc(h.reason)}</strong><small>${dateText(h.at)} · ${esc(userName(h.userId))}</small><p>${h.before ? `${dateText(h.before.start)} ~ ${dateText(h.before.end)} / ${esc(h.before.status)} →<br>` : '최초 계획: '}${dateText(h.after.start)} ~ ${dateText(h.after.end)} / ${esc(h.after.status)}</p></div>`).join('')}`);
 }
 function actualForm(id) {
   const r = data.reservations.find(r => r.id === id), a = data.actuals.find(a => a.reservationId === id);
@@ -219,11 +325,29 @@ document.addEventListener('click', event => {
   actualState = card.dataset.summary === 'missing' ? 'missing' : '';
   search = ''; owner = ''; status = ''; render();
 });
-$('#view-modes').onclick = event => { const button = event.target.closest('[data-mode]'); if (button) { mode = button.dataset.mode; refresh(); } };
+$('#view-modes').onclick = event => { const button = event.target.closest('[data-mode]'); if (button) { mode = button.dataset.mode; rangeDraft = false; refresh(); } };
 $('#previous').onclick = () => move(-1); $('#next').onclick = () => move(1);
-function move(direction) { if (mode === 'month') { const d = new Date(date.slice(0, 7) + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + direction); date = d.toISOString().slice(0, 10); } else date = addDays(date, direction * (mode === 'week' ? 7 : 1)); refresh(); }
-$('#today').onclick = () => { date = today(); refresh(); };
-$('#date-picker').onchange = event => { if (event.target.value) { date = event.target.value; refresh(); } };
+function move(direction) {
+  rangeDraft = false;
+  if (range) { const shift = direction * period().days.length; range = { start: addDays(range.start, shift), end: addDays(range.end, shift) }; date = range.start; }
+  else if (mode === 'year') date = `${Number(date.slice(0, 4)) + direction}-01-01`;
+  else if (mode === 'month') { const d = new Date(date.slice(0, 7) + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + direction); date = d.toISOString().slice(0, 10); }
+  else date = addDays(date, direction * (mode === 'week' ? 7 : 1));
+  refresh();
+}
+function clearRange() { range = null; rangeDraft = false; $('#range-error').textContent = ''; }
+$('#today').onclick = () => { clearRange(); date = today(); refresh(); };
+$('#date-picker').onchange = event => { if (event.target.value) { clearRange(); date = event.target.value; refresh(); } };
+$('#range-form').oninput = () => { rangeDraft = true; $('#range-error').textContent = ''; };
+$('#range-form').onsubmit = event => {
+  event.preventDefault(); const start = $('#range-start').value, end = $('#range-end').value;
+  const valid = value => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+  if (!valid(start) || !valid(end) || start < '2000-01-01' || end > '2100-12-31') { $('#range-error').textContent = '검색 시작일과 종료일을 2000~2100년 안에서 입력해 주세요.'; return; }
+  if (end < start) { $('#range-error').textContent = '종료일은 시작일과 같거나 이후여야 합니다.'; return; }
+  if ((Date.parse(end) - Date.parse(start)) / 86400000 + 1 > 3660) { $('#range-error').textContent = '조회 구간은 최대 10년까지 가능합니다.'; return; }
+  range = { start, end }; rangeDraft = false; date = start; $('#range-error').textContent = ''; refresh();
+};
+$('#clear-range').onclick = () => { clearRange(); refresh(); };
 $('#search').oninput = event => { search = event.target.value; render(); };
 $('#owner-filter').onchange = event => { owner = event.target.value; render(); };
 $('#status-filter').onchange = event => { status = event.target.value; render(); };
@@ -235,7 +359,9 @@ $('#export').onclick = () => { const p = period(); window.location.href = `/api/
 document.addEventListener('click', async event => {
   if (!me) return; const b = event.target.closest('button, .booking-entry');
   try {
-    if (b?.dataset.detail) await detail(b.dataset.detail);
+    if (b?.dataset.openDay) { clearRange(); date = b.dataset.openDay; mode = 'day'; await refresh(); }
+    else if (b?.dataset.openMonth) { clearRange(); date = b.dataset.openMonth + '-01'; mode = 'month'; await refresh(); }
+    else if (b?.dataset.detail) await detail(b.dataset.detail);
     else if (b?.dataset.edit) reservationForm(data.reservations.find(r => r.id === b.dataset.edit));
     else if (b?.dataset.actual) actualForm(b.dataset.actual);
     else if (b?.dataset.removeActual && confirm('이 시험의 실적을 삭제할까요? 계획은 유지되고 실적은 미입력으로 돌아갑니다.')) {
@@ -247,7 +373,12 @@ document.addEventListener('click', async event => {
     else if (b?.id === 'add-user') userForm();
     else if (b?.id === 'add-downtime') downtimeForm();
     else if (b?.id === 'edit-rules') rulesForm();
-    else if (b?.id === 'save-baseline') { await api('/api/baselines', 'POST', { month: date.slice(0, 7) }); toast('월간 기준계획을 저장했습니다.'); await refresh(); }
+    else if (b?.id === 'delete-all-schedules') await scheduleDeleteForm();
+    else if (b?.id === 'add-holiday') holidayForm();
+    else if (b?.id === 'holiday-api-key') holidayKeyForm();
+    else if (b?.id === 'sync-holidays') { b.disabled = true; b.textContent = '갱신 중…'; try { const p = period(), result = await api('/api/holidays/sync', 'POST', { start: midnight(p.start), end: midnight(p.end) }); toast(result.errors.length ? '일부 조회가 실패했습니다. 갱신 상태를 확인해 주세요.' : '공식 공휴일을 갱신했습니다.'); await refresh(); } finally { b.disabled = false; } }
+    else if (b?.dataset.removeHoliday && confirm('추가 등록한 공휴일을 삭제하고 운영일 계산에 다시 포함할까요?')) { await api('/api/holidays/' + b.dataset.removeHoliday, 'DELETE'); await refresh(); }
+    else if (b?.id === 'save-baseline') { await api('/api/baselines', 'POST', { month: period().start.slice(0, 7) }); toast('월간 기준계획을 저장했습니다.'); await refresh(); }
     else if (b?.dataset.baseline) baselineDetail(b.dataset.baseline);
     else if (b?.dataset.removeDowntime && confirm('이 설비 정지 일정을 삭제할까요?')) { await api('/api/downtimes/' + b.dataset.removeDowntime, 'DELETE'); await refresh(); }
     else { const slot = event.target.closest('[data-slot]'); if (slot && !b) reservationForm(null, slot.dataset.slot, slot.dataset.day, slot.dataset.minute); }
