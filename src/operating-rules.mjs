@@ -1,0 +1,58 @@
+export const EQUIPMENT = [
+  { id: 'engine-1', name: '엔진동력계실 #1', group: '엔진 시험', types: ['배압 시험', '토출/방사음 시험'] },
+  { id: 'engine-2', name: '엔진동력계실 #2', group: '엔진 시험', types: ['배압 시험', '토출/방사음 시험'] },
+  { id: 'flow', name: '유동저항 시험실', group: '성능 시험', types: ['유동저항 시험'] },
+  { id: 'thermal-1', name: '열가진 내구시험실 #1', group: '열·내구 시험', types: ['열피로 시험', '열충격 시험', '열피로/열충격 시험', '고온가진 시험', '이음 시험', '기류음 시험', '유동저항 시험', '결빙시험', '기타 성능시험', 'Glass Wool 내구'] },
+  { id: 'thermal-2', name: '열가진 내구시험실 #2', group: '열·내구 시험', types: ['열피로 시험', '열충격 시험', '열피로/열충격 시험', '고온가진 시험', '이음 시험', '기류음 시험', '유동저항 시험', '결빙시험', '기타 성능시험', 'Glass Wool 내구'] },
+  { id: 'endurance', name: '단품 대상내구 시험실', group: '연속 내구', types: ['단품 대상내구 시험', 'SN 커브 추출시험', '성능시험'] },
+];
+export const DEFAULT_RULES = { days: [1, 2, 3, 4, 5], open: 510, close: 1230, breaks: [[750, 810], [1050, 1080]] };
+export const supportsWeekend = id => ['engine-1', 'engine-2', 'flow'].includes(id);
+export const canRunTogether = (a, b) => a.equipmentId === b.equipmentId && ['engine-1', 'engine-2'].includes(a.equipmentId) && ['배압 시험', '토출/방사음 시험'].includes(a.testType) && ['배압 시험', '토출/방사음 시험'].includes(b.testType) && a.testType !== b.testType;
+export const reservationRules = (r, rules) => supportsWeekend(r.equipmentId) && r.includeWeekend === true ? { ...rules, days: [...new Set([...rules.days, 0, 6])] } : rules;
+export const MIN = 60000, DAY = 86400000, OFFSET = 9 * 3600000;
+export const isAroundClock = r => r.equipmentId === 'endurance' && r.testType !== '성능시험';
+export const isContinuous = r => isAroundClock(r) || (r.equipmentId.startsWith('thermal') && ['열피로 시험', '열충격 시험', '열피로/열충격 시험'].includes(r.testType));
+export const ms = v => new Date(v).getTime();
+export const dayStart = t => Math.floor((t + OFFSET) / DAY) * DAY - OFFSET;
+export const clock = t => (t - dayStart(t)) / MIN;
+export const isHoliday = (t, rules) => (rules.holidays || []).some(h => h.date === new Date(t + OFFSET).toISOString().slice(0, 10));
+export const isOperatingDay = (t, rules) => rules.days.includes(new Date(t + OFFSET).getUTCDay()) && !isHoliday(t, rules);
+
+export function validateInterval(start, end, { maxDays = 366 } = {}) {
+  const a = ms(start), b = ms(end);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) throw new Error('종료 일시는 시작 일시보다 뒤여야 합니다.');
+  if (a % (30 * MIN) || b % (30 * MIN)) throw new Error('시간은 30분 경계로 입력해 주세요.');
+  if (b - a > maxDays * DAY) throw new Error(maxDays === 366 ? '한 번의 예약은 최대 366일까지 가능합니다.' : '조회 구간은 최대 10년까지 가능합니다.');
+  return [a, b];
+}
+export function merge(intervals) {
+  const result = [];
+  for (const [a, b] of intervals.filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0])) {
+    const last = result.at(-1);
+    if (last && a <= last[1]) last[1] = Math.max(b, last[1]);
+    else result.push([a, b]);
+  }
+  return result;
+}
+export function intersect(a, b) {
+  return merge(a.flatMap(([s, e]) => b.map(([x, y]) => [Math.max(s, x), Math.min(e, y)])));
+}
+export function subtract(a, b) {
+  let out = merge(a);
+  for (const [x, y] of merge(b)) out = out.flatMap(([s, e]) => y <= s || x >= e ? [[s, e]] : [[s, Math.min(e, x)], [Math.max(s, y), e]].filter(([p, q]) => q > p));
+  return out;
+}
+export const minutes = list => merge(list).reduce((sum, [a, b]) => sum + (b - a) / MIN, 0);
+export function windows(start, end, equipmentId, continuous, rules = DEFAULT_RULES) {
+  const a = ms(start), b = ms(end);
+  if (equipmentId === 'endurance' && continuous) return [[a, b]];
+  const out = [];
+  for (let d = dayStart(a); d < b; d += DAY) {
+    if (!isOperatingDay(d, rules)) continue;
+    let pieces = [[d + rules.open * MIN, d + rules.close * MIN]];
+    if (!continuous) pieces = subtract(pieces, rules.breaks.map(([x, y]) => [d + x * MIN, d + y * MIN]));
+    out.push(...intersect(pieces, [[a, b]]));
+  }
+  return out;
+}
