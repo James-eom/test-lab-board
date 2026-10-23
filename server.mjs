@@ -9,6 +9,7 @@ import { EQUIPMENT, capacity, validateInterval, expandReservation, activeInterva
 import { actualReservation } from './src/consecutive-windows.mjs';
 import { hashPassword, checkPassword, createSession, sessionFor } from './src/auth.mjs';
 import { HolidaySync } from './src/holiday-sync.mjs';
+import { MonthlyPlanService } from './src/monthly-plan-service.mjs';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 function reportYears(start, end) {
   let span;
@@ -23,9 +24,10 @@ async function body(req) {
   let value = ''; for await (const chunk of req) { value += chunk; if (Buffer.byteLength(value) > 65536) fail('요청이 너무 큽니다.', 413); }
   try { const data = JSON.parse(value || '{}'); if (!data || Array.isArray(data) || typeof data !== 'object') fail('요청 형식을 확인해 주세요.'); return data; } catch { fail('요청 형식을 확인해 주세요.'); }
 }
-export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFetch = fetch, backupDir = resolve(dirname(dbPath), 'backups'), backupDb = verifiedBackup } = {}) {
+export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFetch = fetch, backupDir = resolve(dirname(dbPath), 'backups'), backupDb = verifiedBackup, clock = () => Date.now() } = {}) {
   const store = new Store(dbPath), attempts = new Map();
   const holidaySync = new HolidaySync(store, holidayFetch);
+  const monthlyPlans = new MonthlyPlanService(store,holidaySync,{clock});
   const currentYears = () => { const year = Number(new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 4)); return [year, year + 1]; };
   const server = http.createServer(async (req, res) => {
     const json = (data, status = 200) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
@@ -68,6 +70,17 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
       const session = authenticated();
       const admin = () => { if (authenticated().user.role !== 'admin') fail('관리자 권한이 필요합니다.', 403); };
       if (path === '/api/me' && req.method === 'GET') return json({ user: session.user, csrf: session.csrf });
+      if(path==='/api/test-time-standards'&&req.method==='GET')return json(store.testTimeStandards());
+      if(path==='/api/test-time-standards'&&req.method==='PUT'){admin();const input=await body(req);admin();return json(store.saveTestTimeStandards(input));}
+      if(path==='/api/monthly-schedules/preview'&&req.method==='POST'){
+        const input=await body(req),actor=authenticated().user;
+        const result=await monthlyPlans.preview(actor.id,input);authenticated();return json(result);
+      }
+      if(path==='/api/monthly-schedules/confirm'&&req.method==='POST'){
+        const input=await body(req),actor=authenticated().user;
+        if(Object.keys(input).length!==1||typeof input.previewId!=='string'||!input.previewId||input.previewId.length>80)fail('편성안 식별자만 보내 주세요.');
+        return json(await monthlyPlans.confirm(actor.id,input.previewId));
+      }
       if (path === '/api/schedules/deletion-preview' && req.method === 'GET') { admin(); return json(store.scheduleDeletionPreview()); }
       if (path === '/api/schedules' && req.method === 'DELETE') {
         admin(); const input = await body(req);
