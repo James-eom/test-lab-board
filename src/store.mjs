@@ -69,6 +69,26 @@ export class Store {
     });
   }
   customHolidays() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='holidays'").get()) || []; }
+  testTimeStandards() {
+    return parse(this.db.prepare("SELECT payload FROM settings WHERE key='test-time-standards'").get()) || {version:0,entries:EQUIPMENT.flatMap(e=>e.types.map(testType=>({equipmentId:e.id,testType,requiredMinutes:null,enabled:true})))};
+  }
+  saveTestTimeStandards(input) {
+    return this.transaction(()=>{
+      const old=this.testTimeStandards();
+      if(input.version!==old.version) fail('기준시간이 변경되었습니다. 새로고침 후 다시 저장해 주세요.',409);
+      const allowed=EQUIPMENT.flatMap(e=>e.types.map(testType=>({equipmentId:e.id,testType})));
+      if(!Array.isArray(input.entries)||input.entries.length!==allowed.length) fail('기준시간 항목을 확인해 주세요.');
+      const seen=new Set();
+      const entries=input.entries.map(e=>{
+        const key=JSON.stringify([e?.equipmentId,e?.testType]);
+        if(!allowed.some(a=>a.equipmentId===e?.equipmentId&&a.testType===e?.testType)||seen.has(key)||typeof e.enabled!=='boolean'||!(e.requiredMinutes===null||(Number.isSafeInteger(e.requiredMinutes)&&e.requiredMinutes>0&&e.requiredMinutes%30===0))) fail('시험실·항목·필요시간을 확인해 주세요.');
+        seen.add(key); return {equipmentId:e.equipmentId,testType:e.testType,requiredMinutes:e.requiredMinutes,enabled:e.enabled};
+      });
+      const saved={version:old.version+1,entries};
+      this.db.prepare("INSERT INTO settings VALUES('test-time-standards',?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(saved));
+      return saved;
+    });
+  }
   holidayApiKey() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='holiday-api-key'").get()) || ''; }
   saveHolidayApiKey(key) {
     if (typeof key !== 'string' || key.trim().length < 20 || key.trim().length > 512 || /\s/.test(key.trim())) fail('인증키 형식을 확인해 주세요.');
