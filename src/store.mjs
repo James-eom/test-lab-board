@@ -23,7 +23,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS downtimes(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS automatic_plans(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS monthly_schedule_batches(id TEXT PRIMARY KEY, userId TEXT NOT NULL, payload TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS monthly_schedule_batches(id TEXT PRIMARY KEY, userId TEXT NOT NULL, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS schedule_generation(id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL);
+      INSERT OR IGNORE INTO schedule_generation VALUES(1,0);`);
     if (!this.db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'active')) this.db.exec('ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
     if (!this.db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'version')) this.db.exec('ALTER TABLE users ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
   }
@@ -167,6 +169,7 @@ export class Store {
   }
   monthlyScheduleRevision() {
     const snapshot={reservations:this.reservations(),actuals:this.actuals(),downtimes:this.downtimes(),rules:this.rules(),standards:this.testTimeStandards(),users:this.users(),holidayYears:this.holidayYears()};
+    snapshot.generation=this.db.prepare('SELECT generation FROM schedule_generation WHERE id=1').get().generation;
     return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
   }
   monthlyScheduleBatch(previewId,userId) {
@@ -218,6 +221,7 @@ export class Store {
       const preview = this.scheduleDeletionPreview();
       if (revision !== preview.revision) fail('시험 데이터가 변경되었습니다. 삭제 대상을 다시 확인해 주세요.', 409, 'STALE_DELETION');
       for (const table of Object.keys(preview.counts)) this.db.exec(`DELETE FROM ${table}`);
+      this.db.exec('UPDATE schedule_generation SET generation=generation+1 WHERE id=1');
       return preview.counts;
     });
   }

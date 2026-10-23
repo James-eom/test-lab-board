@@ -83,13 +83,13 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
       }
       if (path === '/api/schedules/deletion-preview' && req.method === 'GET') { admin(); return json(store.scheduleDeletionPreview()); }
       if (path === '/api/schedules' && req.method === 'DELETE') {
-        admin(); const input = await body(req);
+        admin(); const input = await body(req); admin();
         if (input.confirmation !== '전체 시험 일정 삭제') fail('확인 문구를 정확히 입력해 주세요.');
         if (input.revision !== store.scheduleDeletionPreview().revision) fail('시험 데이터가 변경되었습니다. 삭제 대상을 다시 확인해 주세요.', 409, 'STALE_DELETION');
         let backupPath;
         try { backupPath = await backupDb(store.db, backupDir); }
         catch { fail('백업을 완료하지 못해 삭제하지 않았습니다. 서버 백업 폴더와 저장 공간을 확인해 주세요.', 500, 'BACKUP_FAILED'); }
-        const deleted = store.deleteAllSchedules(input.revision);
+        admin(); const deleted = store.deleteAllSchedules(input.revision);
         return json({ deleted, backupFile: basename(backupPath) });
       }
       if (path === '/api/logout' && req.method === 'POST') { store.db.prepare('DELETE FROM sessions WHERE token=?').run(session.token); cookie(''); return json({ ok: true }); }
@@ -106,7 +106,7 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
         if (url.searchParams.has('start') && url.searchParams.has('end')) {
           await holidaySync.refresh(reportYears(url.searchParams.get('start'), url.searchParams.get('end')));
         } else if (year >= 2000 && year <= 2100) await holidaySync.refresh([year - 1, year, year + 1].filter(y => y >= 2000));
-        return json({ equipment: EQUIPMENT, users: store.users(), testTimeStandards:store.testTimeStandards(), reservations: store.reservations().map(r => ({ ...r, plannedMinutes:operatingMinutes(r,store.rules()), intervals: r.status === '취소' ? [] : expandReservation(r, store.rules(), { validateOperatingDays: false }) })), actuals: store.actuals().map(a => ({ ...a, intervals: a.zero ? [] : expandReservation(actualReservation(store.reservation(a.reservationId),a,store.rules()), { ...store.rules(), holidays: [] }) })), baselines: store.baselines(), downtimes: store.downtimes(), rules: store.rules(), holidayYears: store.holidayYears(), holidaySync: holidaySync.status(), customHolidays: store.customHolidays() });
+        return json({ equipment: EQUIPMENT, users: store.users(), testTimeStandards:store.testTimeStandards(), reservations: store.reservations().map(r => ({ ...r, plannedMinutes:r.status==='취소'?0:operatingMinutes(r,store.rules()), intervals: r.status === '취소' ? [] : expandReservation(r, store.rules(), { validateOperatingDays: false }) })), actuals: store.actuals().map(a => ({ ...a, intervals: a.zero ? [] : expandReservation(actualReservation(store.reservation(a.reservationId),a,store.rules()), { ...store.rules(), holidays: [] }) })), baselines: store.baselines(), downtimes: store.downtimes(), rules: store.rules(), holidayYears: store.holidayYears(), holidaySync: holidaySync.status(), customHolidays: store.customHolidays() });
       }
       if (path === '/api/equipment' && req.method === 'GET') return json(EQUIPMENT);
       if (path === '/api/reservations' && req.method === 'GET') return json(store.reservations());
@@ -160,7 +160,7 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
         const start = url.searchParams.get('start'), end = url.searchParams.get('end'); reportYears(start, end);
         const rows = store.reservations().filter(r => r.start < new Date(end).toISOString() && r.end > new Date(start).toISOString()).map(r => {
           const a = store.actuals().find(a => a.reservationId === r.id);
-          return { 시험명: r.title, 프로젝트: r.project, 시험실: EQUIPMENT.find(e => e.id === r.equipmentId).name, 시험종류: r.testType, 담당자: store.users().find(u => u.id === r.ownerId)?.name, 시작: new Date(r.start), 종료: new Date(r.end), 상태: r.status, 실적: !a ? '미입력' : a.zero ? '0시간' : '입력', 실제시작: a?.start ? new Date(a.start) : '', 실제종료: a?.end ? new Date(a.end) : '', 비고: r.note, 주말포함: r.includeWeekend ? '포함' : r.equipmentId === 'endurance' ? '연속 가동' : '기본 운영일', 계획가동시간:operatingMinutes(r,store.rules())/60 };
+          return { 시험명: r.title, 프로젝트: r.project, 시험실: EQUIPMENT.find(e => e.id === r.equipmentId).name, 시험종류: r.testType, 담당자: store.users().find(u => u.id === r.ownerId)?.name, 시작: new Date(r.start), 종료: new Date(r.end), 상태: r.status, 실적: !a ? '미입력' : a.zero ? '0시간' : '입력', 실제시작: a?.start ? new Date(a.start) : '', 실제종료: a?.end ? new Date(a.end) : '', 비고: r.note, 주말포함: r.includeWeekend ? '포함' : r.equipmentId === 'endurance' ? '연속 가동' : '기본 운영일', 계획가동시간:r.status==='취소'?0:operatingMinutes(r,store.rules())/60 };
         });
         const sheet = rows.length ? XLSX.utils.json_to_sheet(rows, { cellDates: true, dateNF: 'yyyy-mm-dd hh:mm' }) : XLSX.utils.aoa_to_sheet([['시험명', '프로젝트', '시험실', '시험종류', '담당자', '시작', '종료', '상태', '실적']]);
         // Excel stores dates without a timezone; export Korea wall-clock values.

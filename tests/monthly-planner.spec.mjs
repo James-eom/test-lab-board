@@ -38,3 +38,10 @@ test('delayed previews do not overwrite changed input or a different page',async
     await page.getByRole('button',{name:'편성안 만들기',exact:true}).click();await started;await row.locator('[data-field=project]').fill('새 입력');await page.locator('[data-page=tests]').click();release();await page.waitForResponse('**/api/monthly-schedules/preview');await expect(page.locator('#page-title')).toHaveText('시험 계획 수립');await page.locator('[data-page=monthly-planner]').click();await expect(row.locator('[data-field=project]')).toHaveValue('새 입력');await expect(page.getByRole('button',{name:'일괄 확정 · 캘린더에 등록',exact:true})).toHaveCount(0);
   }finally{await f.close();}
 });
+test('ordinary team members can read standards but cannot edit the table',async({page,browser})=>{
+  const f=await setup(page);const context=await browser.newContext();try{
+    const account=await(await page.request.get(f.base+'/api/me')).json();
+    await page.request.post(f.base+'/api/users',{headers:{'x-csrf-token':account.csrf},data:{login:'member',name:'팀원',password:'member-password-123'}});
+    const member=await context.newPage();await member.goto(f.base);await member.locator('#auth-form [name=login]').fill('member');await member.locator('#auth-form [name=password]').fill('member-password-123');await member.locator('#auth-submit').click();await expect(member.locator('.schedule-table')).toBeVisible();await member.locator('[data-page=settings]').click();await expect(member.locator('[data-standard-hours]').first()).toBeDisabled();await expect(member.getByRole('button',{name:'기준시간 저장',exact:true})).toHaveCount(0);await member.locator('[data-page=monthly-planner]').click();await expect(member.locator('[data-planner-row]')).toHaveCount(1);
+  }finally{await context.close();await f.close();}
+});

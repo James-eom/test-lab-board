@@ -36,13 +36,25 @@ test('authenticated preview is read-only, confirm is atomic/idempotent and repor
 test('independent previews conflict safely and expired, stale or consumed plans cannot register',async()=>{
   const f=await fixture(),{request,headers,input,app}=f;
   try{
+    await request(headers,'/api/users','POST',{login:'second',name:'두 번째 사용자',password:'second-password-123'});
+    const login=await request({},'/api/login','POST',{login:'second',password:'second-password-123'}),second=await login.json(),secondHeaders={cookie:login.headers.get('set-cookie').split(';')[0],'x-csrf-token':second.csrf};
     const preview=async()=>await (await request(headers,'/api/monthly-schedules/preview','POST',input)).json();
     f.setNow('2026-11-09T08:15');const a=await preview();f.setNow('2026-11-09T08:31');assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:a.previewId})).status,409);
-    f.setNow('2026-11-09T08:00');const b=await preview(),c=await preview();
-    const results=await Promise.all([b,c].map(p=>request(headers,'/api/monthly-schedules/confirm','POST',{previewId:p.previewId})));assert.deepEqual(results.map(x=>x.status).sort(),[200,409]);assert.equal(app.store.reservations().length,1);
+    f.setNow('2026-11-09T08:00');const b=await preview(),c=await (await request(secondHeaders,'/api/monthly-schedules/preview','POST',input)).json();
+    const results=await Promise.all([[b,headers],[c,secondHeaders]].map(([p,h])=>request(h,'/api/monthly-schedules/confirm','POST',{previewId:p.previewId})));assert.deepEqual(results.map(x=>x.status).sort(),[200,409]);assert.equal(app.store.reservations().length,1);
     app.store.deleteAllSchedules(app.store.scheduleDeletionPreview().revision);
-    const id=results[0].status===200?b.previewId:c.previewId;assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:id})).status,410);assert.equal(app.store.reservations().length,0);
+    const won=results[0].status===200,id=won?b.previewId:c.previewId;assert.equal((await request(won?headers:secondHeaders,'/api/monthly-schedules/confirm','POST',{previewId:id})).status,410);assert.equal(app.store.reservations().length,0);
     const d=await preview();app.store.saveHoliday({date:'2026-11-11',name:'추가'});assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:d.previewId})).status,409);
+  }finally{await f.close();}
+});
+test('preview expiry, bounded retention, disabled owners and incomplete plans reject confirmation',async()=>{
+  const f=await fixture(),{request,headers,input,app}=f;try{
+    const preview=async body=>await(await request(headers,'/api/monthly-schedules/preview','POST',body||input)).json();
+    const expired=await preview();f.setNow('2026-11-09T08:30');assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:expired.previewId})).status,410);
+    f.setNow('2026-11-09T08:00');const oldest=await preview();for(let i=0;i<5;i++)await preview();assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:oldest.previewId})).status,410);
+    const incomplete=await preview({...input,items:[{...input.items[0],requiredMinutes:999990}]});assert.equal(incomplete.result.unplaced.length,1);assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:incomplete.previewId})).status,409);
+    const standards=app.store.testTimeStandards(),p=await preview();app.store.saveTestTimeStandards({...standards,entries:standards.entries.map((e,i)=>i?e:{...e,requiredMinutes:30})});assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:p.previewId})).status,409);
+    const owner=app.store.addUser('newowner','새 담당자','hash'),owned=await preview({...input,items:[{...input.items[0],ownerId:owner.id}]});app.store.removeUser(owner.id,f.account.user.id);assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:owned.previewId})).status,409);
   }finally{await f.close();}
 });
 test('member cannot change standards or confirm another user plan; delayed revoked sessions are rejected',async()=>{
@@ -58,5 +70,25 @@ test('member cannot change standards or confirm another user plan; delayed revok
     app.store.db.prepare('DELETE FROM sessions WHERE userId=?').run(member.user.id);resume();assert.equal((await pending).status,401);app.holidaySync.refresh=original;
     const service=new MonthlyPlanService(app.store,app.holidaySync,{clock:()=>Date.parse(iso('2026-11-09T08:00'))});
     await assert.rejects(service.confirm(f.account.user.id,p.previewId),e=>e.status===410);
+  }finally{await f.close();}
+});
+test('bulk deletion invalidates rejected unconfirmed previews even when bookings return to empty',async()=>{
+  const f=await fixture(),{request,headers,input,app}=f;try{
+    const preview=async()=>await(await request(headers,'/api/monthly-schedules/preview','POST',input)).json();
+    const a=await preview(),b=await preview();
+    assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:a.previewId})).status,200);
+    assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:b.previewId})).status,409);
+    app.store.deleteAllSchedules(app.store.scheduleDeletionPreview().revision);
+    assert.equal((await request(headers,'/api/monthly-schedules/confirm','POST',{previewId:b.previewId})).status,409);
+    assert.equal(app.store.reservations().length,0);
+  }finally{await f.close();}
+});
+test('cancelled bookings remain queryable after operating hours change and export with zero occupancy',async()=>{
+  const f=await fixture(),{request,headers,app,account}=f;try{
+    app.store.saveReservation({title:'취소 시험',project:'보존',equipmentId:'engine-1',testType:'배압 시험',ownerId:account.user.id,start:iso('2026-11-09T08:30'),end:iso('2026-11-09T09:30'),status:'취소'},account.user.id);
+    app.store.saveRules({...app.store.rules(),open:600});
+    const state=await request(headers,'/api/state');assert.equal(state.status,200);const r=(await state.json()).reservations[0];assert.equal(r.plannedMinutes,0);assert.deepEqual(r.intervals,[]);
+    const query=new URLSearchParams({start:iso('2026-11-01T00:00'),end:iso('2026-12-01T00:00')});
+    const res=await request(headers,'/api/export?'+query);assert.equal(res.status,200);const book=XLSX.read(Buffer.from(await res.arrayBuffer()),{type:'buffer'});assert.equal(XLSX.utils.sheet_to_json(book.Sheets['시험계획'])[0].계획가동시간,0);
   }finally{await f.close();}
 });
