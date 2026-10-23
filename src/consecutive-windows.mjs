@@ -54,3 +54,9 @@ export function validatePlannedWindows(r,rules=DEFAULT_RULES,{validateOperatingD
   const current=reservationRules(r,rules);
   return isAroundClock(r)?normalized:normalized.filter(i=>isOperatingDay(ms(i.start),current));
 }
+export function actualReservation(r,actual,rules=DEFAULT_RULES) {
+  const result={...r,start:actual.start,end:actual.end};
+  delete result.plannedWindows; delete result.monthlySchedule;
+  if(r.plannedWindows) result.plannedWindows=consecutiveWindowsBetween(result,{...rules,holidays:[]});
+  return result;
+}

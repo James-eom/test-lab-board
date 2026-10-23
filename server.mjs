@@ -5,7 +5,8 @@ import { verifiedBackup } from './src/backup.mjs';
 import { fileURLToPath } from 'node:url';
 import XLSX from 'xlsx';
 import { Store, fail } from './src/store.mjs';
-import { EQUIPMENT, capacity, validateInterval, expandReservation, activeIntervals, merge } from './src/schedule.mjs';
+import { EQUIPMENT, capacity, validateInterval, expandReservation, activeIntervals, operatingMinutes, merge } from './src/schedule.mjs';
+import { actualReservation } from './src/consecutive-windows.mjs';
 import { hashPassword, checkPassword, createSession, sessionFor } from './src/auth.mjs';
 import { HolidaySync } from './src/holiday-sync.mjs';
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -22,7 +23,7 @@ async function body(req) {
   let value = ''; for await (const chunk of req) { value += chunk; if (Buffer.byteLength(value) > 65536) fail('요청이 너무 큽니다.', 413); }
   try { const data = JSON.parse(value || '{}'); if (!data || Array.isArray(data) || typeof data !== 'object') fail('요청 형식을 확인해 주세요.'); return data; } catch { fail('요청 형식을 확인해 주세요.'); }
 }
-export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFetch = fetch, backupDir = resolve(dirname(dbPath), 'backups') } = {}) {
+export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFetch = fetch, backupDir = resolve(dirname(dbPath), 'backups'), backupDb = verifiedBackup } = {}) {
   const store = new Store(dbPath), attempts = new Map();
   const holidaySync = new HolidaySync(store, holidayFetch);
   const currentYears = () => { const year = Number(new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 4)); return [year, year + 1]; };
@@ -55,12 +56,17 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
         if (count.until < Date.now()) { count.n = 0; count.until = Date.now() + 600000; }
         if (count.n >= 10) fail('잠시 후 다시 로그인해 주세요.', 429);
         const data = await body(req), u = typeof data.login === 'string' ? store.db.prepare('SELECT * FROM users WHERE login=?').get(data.login) : null;
-        if (!u || !checkPassword(data.password, u.hash)) { count.n++; attempts.set(ip, count); fail('아이디 또는 비밀번호를 확인해 주세요.', 401); }
+        if (!u || !u.active || !checkPassword(data.password, u.hash)) { count.n++; attempts.set(ip, count); fail('아이디 또는 비밀번호를 확인해 주세요.', 401); }
         attempts.delete(ip); const session = createSession(store, u.id); cookie(session.token); return json({ user: store.users().find(x => x.id === u.id), csrf: session.csrf });
       }
-      const session = sessionFor(store, req); if (!session) fail('로그인이 필요합니다.', 401);
-      if (req.method !== 'GET' && req.headers['x-csrf-token'] !== session.csrf) fail('요청을 확인할 수 없습니다. 다시 로그인해 주세요.', 403);
-      const admin = () => { if (session.user.role !== 'admin') fail('관리자 권한이 필요합니다.', 403); };
+      const authenticated = () => {
+        const current = sessionFor(store, req);
+        if (!current) fail('로그인이 필요합니다.', 401);
+        if (req.method !== 'GET' && req.headers['x-csrf-token'] !== current.csrf) fail('요청을 확인할 수 없습니다. 다시 로그인해 주세요.', 403);
+        return current;
+      };
+      const session = authenticated();
+      const admin = () => { if (authenticated().user.role !== 'admin') fail('관리자 권한이 필요합니다.', 403); };
       if (path === '/api/me' && req.method === 'GET') return json({ user: session.user, csrf: session.csrf });
       if (path === '/api/schedules/deletion-preview' && req.method === 'GET') { admin(); return json(store.scheduleDeletionPreview()); }
       if (path === '/api/schedules' && req.method === 'DELETE') {
@@ -68,27 +74,45 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
         if (input.confirmation !== '전체 시험 일정 삭제') fail('확인 문구를 정확히 입력해 주세요.');
         if (input.revision !== store.scheduleDeletionPreview().revision) fail('시험 데이터가 변경되었습니다. 삭제 대상을 다시 확인해 주세요.', 409, 'STALE_DELETION');
         let backupPath;
-        try { backupPath = await verifiedBackup(store.db, backupDir); }
+        try { backupPath = await backupDb(store.db, backupDir); }
         catch { fail('백업을 완료하지 못해 삭제하지 않았습니다. 서버 백업 폴더와 저장 공간을 확인해 주세요.', 500, 'BACKUP_FAILED'); }
         const deleted = store.deleteAllSchedules(input.revision);
         return json({ deleted, backupFile: basename(backupPath) });
       }
       if (path === '/api/logout' && req.method === 'POST') { store.db.prepare('DELETE FROM sessions WHERE token=?').run(session.token); cookie(''); return json({ ok: true }); }
-      if (path === '/api/users' && req.method === 'POST') { admin(); const d = await body(req); if (store.users().length >= 6) fail('첫 버전은 팀원 6명까지 등록할 수 있습니다.'); return json(store.addUser(d.login, d.name, hashPassword(d.password), d.role || 'member'), 201); }
+      if (path === '/api/users' && req.method === 'POST') { admin(); const d = await body(req); admin(); return json(store.addUser(d.login, d.name, hashPassword(d.password), d.role || 'member'), 201); }
+      const userEdit = /^\/api\/users\/([^/]+)$/.exec(path);
+      if (userEdit && req.method === 'PUT') {
+        admin(); const d = await body(req); admin();
+        const hash = d.password === undefined || d.password === '' ? undefined : hashPassword(d.password);
+        return json(store.updateUser(userEdit[1], d, hash));
+      }
+      if (userEdit && req.method === 'DELETE') { admin(); return json(store.removeUser(userEdit[1], session.user.id)); }
       if (path === '/api/state' && req.method === 'GET') {
         const year = Number(url.searchParams.get('year'));
         if (url.searchParams.has('start') && url.searchParams.has('end')) {
           await holidaySync.refresh(reportYears(url.searchParams.get('start'), url.searchParams.get('end')));
         } else if (year >= 2000 && year <= 2100) await holidaySync.refresh([year - 1, year, year + 1].filter(y => y >= 2000));
-        return json({ equipment: EQUIPMENT, users: store.users(), reservations: store.reservations().map(r => ({ ...r, intervals: r.status === '취소' ? [] : expandReservation(r, store.rules(), { validateOperatingDays: false }) })), actuals: store.actuals().map(a => ({ ...a, intervals: a.zero ? [] : expandReservation({ ...store.reservation(a.reservationId), ...a }, { ...store.rules(), holidays: [] }) })), baselines: store.baselines(), downtimes: store.downtimes(), rules: store.rules(), holidayYears: store.holidayYears(), holidaySync: holidaySync.status(), customHolidays: store.customHolidays() });
+        return json({ equipment: EQUIPMENT, users: store.users(), reservations: store.reservations().map(r => ({ ...r, plannedMinutes:operatingMinutes(r,store.rules()), intervals: r.status === '취소' ? [] : expandReservation(r, store.rules(), { validateOperatingDays: false }) })), actuals: store.actuals().map(a => ({ ...a, intervals: a.zero ? [] : expandReservation(actualReservation(store.reservation(a.reservationId),a,store.rules()), { ...store.rules(), holidays: [] }) })), baselines: store.baselines(), downtimes: store.downtimes(), rules: store.rules(), holidayYears: store.holidayYears(), holidaySync: holidaySync.status(), customHolidays: store.customHolidays() });
       }
       if (path === '/api/equipment' && req.method === 'GET') return json(EQUIPMENT);
       if (path === '/api/reservations' && req.method === 'GET') return json(store.reservations());
       if (path === '/api/reservations' && req.method === 'POST') return json(store.saveReservation(await body(req), session.user.id), 201);
       const history = /^\/api\/reservations\/([^/]+)\/history$/.exec(path);
       if (history && req.method === 'GET') return json(store.history(history[1]));
+      const deletionPreview = /^\/api\/reservations\/([^/]+)\/deletion-preview$/.exec(path);
+      if (deletionPreview && req.method === 'GET') return json(store.reservationDeletionPreview(deletionPreview[1], session.user.id));
       const edit = /^\/api\/reservations\/([^/]+)$/.exec(path);
       if (edit && req.method === 'PUT') return json(store.saveReservation(await body(req), session.user.id, edit[1]));
+      if (edit && req.method === 'DELETE') {
+        const input = await body(req); const actor = authenticated().user;
+        if (input.confirmation !== '시험 삭제') fail('시험 삭제 확인이 필요합니다.');
+        if (input.revision !== store.reservationDeletionPreview(edit[1], actor.id).revision) fail('시험 정보나 실적이 변경되었습니다. 상세 창을 다시 열고 삭제해 주세요.', 409, 'STALE_DELETION');
+        let backupPath;
+        try { backupPath = await backupDb(store.db, backupDir); }
+        catch { fail('백업을 완료하지 못해 삭제하지 않았습니다. 서버 백업 폴더와 저장 공간을 확인해 주세요.', 500, 'BACKUP_FAILED'); }
+        return json({ ...store.deleteReservation(edit[1], input.revision, authenticated().user.id), backupFile: basename(backupPath) });
+      }
       if (path === '/api/actuals' && req.method === 'POST') return json(store.saveActual(await body(req), session.user.id));
       if (/^\/api\/actuals\/[^/]+$/.test(path) && req.method === 'DELETE') { store.removeActual(path.split('/').at(-1)); return json({ ok: true }); }
       if (path === '/api/baselines' && req.method === 'POST') { admin(); return json(store.saveBaseline((await body(req)).month, session.user.id), 201); }
@@ -107,7 +131,7 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
         return json(EQUIPMENT.map(e => {
           const bookings = all.filter(r => r.equipmentId === e.id && r.status !== '취소' && r.start < new Date(end).toISOString() && r.end > new Date(start).toISOString());
           const cap = capacity({ equipmentId: e.id, start, end, reservations: bookings, rules, downtimes: stops.filter(d => d.equipmentId === e.id) });
-          const recorded = bookings.flatMap(r => { const a = actuals.find(a => a.reservationId === r.id); return a && !a.zero ? [{ ...r, start: a.start, end: a.end }] : []; });
+          const recorded = bookings.flatMap(r => { const a = actuals.find(a => a.reservationId === r.id); return a && !a.zero ? [actualReservation(r,a,rules)] : []; });
           const actualMinutes = capacity({ equipmentId: e.id, start, end, reservations: recorded, rules: { ...rules, holidays: [] }, downtimes: stops.filter(d => d.equipmentId === e.id) }).plannedMinutes;
           const originalBookings = originals.filter(r => r.equipmentId === e.id && (r.plannedIntervals ? overlaps(r.plannedIntervals) : new Date(r.start).getTime() < periodEnd && new Date(r.end).getTime() > periodStart));
           const unknownOriginalPlans = originalBookings.filter(r => r.plannedIntervals === null).length;
@@ -123,7 +147,7 @@ export function createApp({ dbPath = resolve(ROOT, 'data/lab.sqlite'), holidayFe
         const start = url.searchParams.get('start'), end = url.searchParams.get('end'); reportYears(start, end);
         const rows = store.reservations().filter(r => r.start < new Date(end).toISOString() && r.end > new Date(start).toISOString()).map(r => {
           const a = store.actuals().find(a => a.reservationId === r.id);
-          return { 시험명: r.title, 프로젝트: r.project, 시험실: EQUIPMENT.find(e => e.id === r.equipmentId).name, 시험종류: r.testType, 담당자: store.users().find(u => u.id === r.ownerId)?.name, 시작: new Date(r.start), 종료: new Date(r.end), 상태: r.status, 실적: !a ? '미입력' : a.zero ? '0시간' : '입력', 실제시작: a?.start ? new Date(a.start) : '', 실제종료: a?.end ? new Date(a.end) : '', 비고: r.note, 주말포함: r.includeWeekend ? '포함' : r.equipmentId === 'endurance' ? '연속 가동' : '기본 운영일' };
+          return { 시험명: r.title, 프로젝트: r.project, 시험실: EQUIPMENT.find(e => e.id === r.equipmentId).name, 시험종류: r.testType, 담당자: store.users().find(u => u.id === r.ownerId)?.name, 시작: new Date(r.start), 종료: new Date(r.end), 상태: r.status, 실적: !a ? '미입력' : a.zero ? '0시간' : '입력', 실제시작: a?.start ? new Date(a.start) : '', 실제종료: a?.end ? new Date(a.end) : '', 비고: r.note, 주말포함: r.includeWeekend ? '포함' : r.equipmentId === 'endurance' ? '연속 가동' : '기본 운영일', 계획가동시간:operatingMinutes(r,store.rules())/60 };
         });
         const sheet = rows.length ? XLSX.utils.json_to_sheet(rows, { cellDates: true, dateNF: 'yyyy-mm-dd hh:mm' }) : XLSX.utils.aoa_to_sheet([['시험명', '프로젝트', '시험실', '시험종류', '담당자', '시작', '종료', '상태', '실적']]);
         // Excel stores dates without a timezone; export Korea wall-clock values.

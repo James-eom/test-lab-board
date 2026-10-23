@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, createHash } from 'node:crypto';
-import { EQUIPMENT, DEFAULT_RULES, expandReservation, activeIntervals, validateInterval, supportsWeekend, canRunTogether } from './schedule.mjs';
+import { EQUIPMENT, DEFAULT_RULES, expandReservation, activeIntervals, operatingMinutes, validateInterval, supportsWeekend, canRunTogether } from './schedule.mjs';
+import { consecutiveWindowsBetween, actualReservation } from './consecutive-windows.mjs';
 import { NATIONAL_HOLIDAYS, HOLIDAY_YEARS } from './holidays.mjs';
 
 export function fail(message, status = 400, code) { throw Object.assign(new Error(message), { status, code }); }
@@ -21,7 +22,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS baselines(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS downtimes(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, payload TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS automatic_plans(id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS automatic_plans(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS monthly_schedule_batches(id TEXT PRIMARY KEY, userId TEXT NOT NULL, payload TEXT NOT NULL);`);
     if (!this.db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'active')) this.db.exec('ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
     if (!this.db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'version')) this.db.exec('ALTER TABLE users ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
   }
@@ -124,8 +126,9 @@ export class Store {
   saveReservation(input, userId, id) {
     return this.transaction(() => this.writeReservation(input, userId, id));
   }
-  writeReservation(input, userId, id) {
+  writeReservation(input, userId, id, {trustedAutomatic=false}={}) {
       const old = id ? this.reservation(id) : null;
+      if(!old&&!trustedAutomatic&&(input.plannedWindows!==undefined||input.monthlySchedule!==undefined)) fail('일별 구간은 자동 편성 확정으로만 등록할 수 있습니다.');
       if (id && !old) fail('예약을 찾을 수 없습니다.', 404);
       if (old && input.version !== old.version) fail('다른 팀원이 변경했습니다. 최신 내용을 다시 확인해 주세요.', 409);
       if (old && !text(input.reason || '', 500)) fail('변경 사유를 입력해 주세요.');
@@ -140,6 +143,12 @@ export class Store {
         start: new Date(input.start).toISOString(), end: new Date(input.end).toISOString(), includeWeekend: input.includeWeekend === true, status: input.status, note: text(input.note || '', 2000), version: (old?.version || 0) + 1, createdAt: old?.createdAt || now(), updatedAt: now(), ...(old?.automaticPlan ? { automaticPlan: old.automaticPlan } : {}) };
       if (!r.title) fail('시험명을 입력해 주세요.');
       const unchangedPeriod = old && old.equipmentId === r.equipmentId && old.testType === r.testType && old.start === r.start && old.end === r.end && (old.includeWeekend === true) === r.includeWeekend;
+      if(trustedAutomatic) {r.plannedWindows=input.plannedWindows;r.monthlySchedule=input.monthlySchedule;}
+      else if(old?.plannedWindows) {
+        r.monthlySchedule=old.monthlySchedule;
+        if(!unchangedPeriod&&this.db.prepare('SELECT 1 FROM actuals WHERE reservationId=?').get(id)) fail('실적이 등록된 시험은 기간·설비·종류·주말 포함 변경 전에 실적을 확인해 주세요.',409);
+        try {r.plannedWindows=unchangedPeriod?old.plannedWindows:consecutiveWindowsBetween(r,this.rules());}catch(e){fail(e.message);}
+      }
       let intervals;
       try { intervals = expandReservation(r, this.rules(), { validateOperatingDays: !unchangedPeriod }); }
       catch (e) { fail(e.message); }
@@ -155,6 +164,30 @@ export class Store {
       if (r.status !== '취소') for (const i of intervals) this.db.prepare('INSERT INTO intervals VALUES(?,?,?,?)').run(r.id, r.equipmentId, i.start, i.end);
       this.db.prepare('INSERT INTO history(reservationId,payload) VALUES(?,?)').run(r.id, JSON.stringify({ before: old, after: r, ...(!old ? { plannedIntervals: activeIntervals(r, this.rules()) } : {}), reason: text(input.reason || '최초 등록', 500), userId, at: now() }));
       return r;
+  }
+  monthlyScheduleRevision() {
+    const snapshot={reservations:this.reservations(),actuals:this.actuals(),downtimes:this.downtimes(),rules:this.rules(),standards:this.testTimeStandards(),users:this.users(),holidayYears:this.holidayYears()};
+    return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+  }
+  monthlyScheduleBatch(previewId,userId) {
+    const row=this.db.prepare('SELECT * FROM monthly_schedule_batches WHERE id=?').get(previewId);
+    if(row&&row.userId!==userId) fail('다른 사용자의 편성안입니다.',403);
+    return parse(row)||null;
+  }
+  saveMonthlySchedule({previewId,userId,revision,assignments,nowMs}) {
+    return this.transaction(()=>{
+      if(!this.users().some(u=>u.id===userId&&u.active)) fail('로그인이 필요합니다.',401);
+      const existing=this.monthlyScheduleBatch(previewId,userId);if(existing)return existing;
+      if(revision!==this.monthlyScheduleRevision()) fail('일정 또는 설정이 변경되었습니다. 편성안을 다시 만들어 주세요.',409,'STALE_PLAN');
+      if(typeof previewId!=='string'||!previewId||!Array.isArray(assignments)||!assignments.length||assignments.length>30||!Number.isFinite(nowMs)) fail('편성안을 확인해 주세요.');
+      const reservationIds=assignments.map(a=>{
+        if(Date.parse(a.start)<nowMs||!this.users().some(u=>u.id===a.ownerId&&u.active)) fail('시작 시간이 지났거나 담당자가 변경되었습니다. 다시 편성해 주세요.',409);
+        if(!Number.isSafeInteger(a.requiredMinutes)||a.requiredMinutes<=0||a.requiredMinutes%30||operatingMinutes(a,this.rules())!==a.requiredMinutes) fail('총 필요 가동시간과 편성 시간이 다릅니다.');
+        return this.writeReservation({...a,status:'계획',note:'',monthlySchedule:{batchId:previewId,requiredMinutes:a.requiredMinutes}},userId,undefined,{trustedAutomatic:true}).id;
+      });
+      const result={previewId,reservationIds,confirmedAt:new Date(nowMs).toISOString()};
+      this.db.prepare('INSERT INTO monthly_schedule_batches VALUES(?,?,?)').run(previewId,userId,JSON.stringify(result));return result;
+    });
   }
   reservationDeletionPreview(id, userId) {
     const reservation = this.reservation(id);
@@ -176,7 +209,7 @@ export class Store {
     });
   }
   scheduleDeletionPreview() {
-    const tables = ['intervals', 'actuals', 'history', 'baselines', 'automatic_plans', 'reservations'];
+    const tables = ['intervals', 'actuals', 'history', 'baselines', 'automatic_plans', 'monthly_schedule_batches', 'reservations'];
     const snapshot = Object.fromEntries(tables.map(table => [table, this.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
     return { counts: Object.fromEntries(tables.map(table => [table, snapshot[table].length])), revision: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex') };
   }
@@ -210,7 +243,7 @@ export class Store {
       actual.start = new Date(input.start).toISOString(); actual.end = new Date(input.end).toISOString();
       if (actual.start < r.start || actual.end > r.end) fail('실적 기간은 예약 기간 안으로 입력해 주세요.');
       // Actual activity is evidence, even when a holiday is registered later.
-      expandReservation({ ...r, ...actual }, { ...this.rules(), holidays: [] });
+      expandReservation(actualReservation(r,actual,this.rules()), { ...this.rules(), holidays: [] });
     } else if (!actual.note) fail('0시간 실적의 사유를 입력해 주세요.');
     this.db.prepare('INSERT INTO actuals VALUES(?,?) ON CONFLICT(reservationId) DO UPDATE SET payload=excluded.payload').run(r.id, JSON.stringify(actual));
     return actual;
