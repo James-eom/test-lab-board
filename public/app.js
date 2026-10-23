@@ -19,6 +19,8 @@ let me, csrf = '', setup = false, data, capa = [], page = 'schedule', mode = 'we
 let search = '', owner = '', status = '', actualState = '';
 let range = null, rangeDraft = false, refreshQueued = false;
 let todayPopupPending = false;
+let monthlyPlanner;
+const plannerUI=()=>monthlyPlanner ||= window.MonthlyPlannerUI.create({api,getUsers:()=>data.users,getEquipment:()=>data.equipment,getRole:()=>me?.role,getStandards:()=>data.testTimeStandards,redraw:()=>{if(me)render();},onRegistered:async month=>{if(month){date=month+'-01';mode='month';clearRange();page='schedule';toast('자동 편성 시험을 등록했습니다.');}await refresh();}});
 const userName = id => { const u = data.users.find(u => u.id === id); return u ? u.name + (u.active === false ? ' (삭제됨)' : '') : '미지정'; };
 const equipmentName = id => data.equipment.find(e => e.id === id)?.name || id;
 const holidayName = day => data.rules.holidays.filter(h => h.date === day).map(h => h.name).join(' / ');
@@ -44,7 +46,7 @@ async function api(path, method = 'GET', body) {
 }
 function toast(message) { $('#toast').textContent = message; $('#toast').classList.remove('hidden'); setTimeout(() => $('#toast').classList.add('hidden'), 3200); }
 function error(message) { $('#error-banner').textContent = message; $('#error-banner').classList.remove('hidden'); }
-function showAuth() { $('#auth-screen').classList.remove('hidden'); $('#app-screen').classList.add('hidden'); $('#logout').classList.add('hidden'); $('#user-name').textContent = ''; $('#sync-status').textContent = '로그인 대기'; }
+function showAuth() { monthlyPlanner?.invalidatePreview();monthlyPlanner=null; $('#auth-screen').classList.remove('hidden'); $('#app-screen').classList.add('hidden'); $('#logout').classList.add('hidden'); $('#user-name').textContent = ''; $('#sync-status').textContent = '로그인 대기'; }
 async function init() {
   try {
     setup = (await api('/api/status')).setupRequired;
@@ -92,6 +94,7 @@ function showTodayTests() {
 function render() {
   if (!data || !me) return;
   const titles = { schedule: ['가동 현황', '장비별 시험 일정과 가동 시간을 확인합니다.'], tests: ['시험 계획 수립', '시험별 일정, 담당자와 진행 상태를 관리합니다.'], capacity: ['설비 CAPA 현황', '선택 기간의 가용 시간과 계획·실적을 비교합니다.'], history: ['기준계획 · 이력', '월간 기준계획과 현재 일정의 차이를 확인합니다.'], settings: ['운영 설정', '팀 계정과 설비 운영 기준을 관리합니다.'] };
+  titles['monthly-planner']=['자동 시험 일정 편성','총 필요 가동시간으로 월별 일정을 검토하고 등록합니다.'];
   $('#page-title').textContent = titles[page][0]; $('#page-description').textContent = titles[page][1];
   document.querySelectorAll('.nav').forEach(b => b.classList.toggle('active', b.dataset.page === page));
   document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('selected', b.dataset.mode === mode));
@@ -111,9 +114,10 @@ function render() {
     ['관리 설비', '6', '대', '시험실 운영 기준 적용', 'boxes', false], ['등록된 시험', selected.length, '건', `진행 ${running}건 · 선택 기간`, 'clipboard-list', false],
     ['계획 점유율', available ? (planned / available * 100).toFixed(1) : '—', available ? '%' : '', `${hours(planned)} / ${hours(available)}시간 · 전체 설비`, 'gauge', true], ['실적 미입력', missing, '건', '계획 시간을 실적으로 대체하지 않음', 'clock-3', false]
   ].map(([label, v, unit, note, i, emphasis], index) => `<button class="metric" data-summary="${['equipment', 'tests', 'occupancy', 'missing'][index]}" type="button"><span class="metric-label">${icon(i)}${label}</span><span class="metric-value ${emphasis ? 'emphasis' : ''}">${v}<span>${unit}</span></span><span class="metric-note">${note}</span></button>`).join('');
-  $('#new-test').classList.toggle('hidden', ['history', 'settings'].includes(page));
-  $('.filter-bar').classList.toggle('hidden', ['capacity', 'history', 'settings'].includes(page));
-  $('#content').innerHTML = page === 'schedule' ? scheduleView() : page === 'tests' ? testsView() : page === 'capacity' ? capacityView() : page === 'history' ? historyView() : settingsView() + holidaySettings() + scheduleDeleteSettings();
+  $('#new-test').classList.toggle('hidden', ['history', 'settings','monthly-planner'].includes(page));
+  $('.filter-bar').classList.toggle('hidden', ['capacity', 'history', 'settings','monthly-planner'].includes(page));
+  for(const selector of ['.toolbar','#range-form','#summary-strip'])$(selector).classList.toggle('hidden',page==='monthly-planner');
+  $('#content').innerHTML = page === 'monthly-planner'?plannerUI().render():page === 'schedule' ? scheduleView() : page === 'tests' ? testsView() : page === 'capacity' ? capacityView() : page === 'history' ? historyView() : settingsView() + plannerUI().renderStandards() + holidaySettings() + scheduleDeleteSettings();
   $('#footer-status').textContent = `동기화 ${new Date().toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour12: false })}`;
   icons();
 }
@@ -273,6 +277,7 @@ function reservationForm(r, equipmentId, day, minute) {
   const end = r ? local(r.end) : local(new Date(new Date(start + ':00+09:00').getTime() + 3600000));
   modal(r ? '시험계획 수정' : '시험 등록', `<form id="reservation-form" data-id="${r?.id || ''}"><div class="form-grid"><label class="full">차종 / 프로젝트<input name="project" value="${esc(r?.project || '')}" maxlength="100"></label><label>시험실<select name="equipmentId">${data.equipment.map(e => option(e.id, e.name, eq)).join('')}</select></label><label>시험 종류<select name="testType"></select></label><label class="full">담당자<select name="ownerId">${data.users.filter(u => u.active || u.id === r?.ownerId).map(u => option(u.id, userName(u.id), r?.ownerId || me.id)).join('')}</select></label><label>시작 일시<input name="start" type="datetime-local" step="1800" value="${start}" required></label><label>종료 일시<input name="end" type="datetime-local" step="1800" value="${end}" required></label><label class="full checkbox-label"><input type="checkbox" name="includeWeekend" ${r?.includeWeekend ? 'checked' : ''}>주말 포함</label>${r ? '<label>변경 사유<input name="reason" required maxlength="500"></label>' : ''}<label class="full">비고<textarea name="note" maxlength="2000">${esc(r?.note || '')}</textarea></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">${icon('check')}저장</button></div></form>`);
   const form = $('#reservation-form'), typeSelect = form.elements.testType;
+  if(r?.monthlySchedule)form.insertAdjacentHTML('afterbegin',`<p class="warning-note">자동 편성 당시 요구시간 ${hours(r.monthlySchedule.requiredMinutes)}시간 · 현재 계획 가동시간 ${hours(r.plannedMinutes)}시간. 기간·시험실·종류 변경 시 연속 운영일 구간을 재계산합니다. 저장 후 상세에서 변경된 시간을 확인해 주세요.</p>`);
   form.querySelector('.error').insertAdjacentHTML('beforebegin', '<p class="muted" id="reservation-operating-rule"></p>');
   const syncOperatingRule = () => {
     const continuous = form.elements.equipmentId.value === 'endurance' && typeSelect.value !== '성능시험';
@@ -306,7 +311,9 @@ async function detail(id) {
   const r = data.reservations.find(r => r.id === id); if (!r) return;
   const hist = await api(`/api/reservations/${r.id}/history`), a = data.actuals.find(a => a.reservationId === r.id);
   const canDelete = me.role === 'admin' || (hist[0]?.before === null && hist[0].userId === me.id);
+  const durationInfo=r.monthlySchedule?`<p class="warning-note">계획 가동시간 ${hours(r.plannedMinutes)}시간 · 자동 편성 당시 요구시간 ${hours(r.monthlySchedule.requiredMinutes)}시간</p>`:'';
   modal('시험 상세', `<dl class="detail-grid"><div class="full"><dt>시험명</dt><dd><strong>${esc(r.title)}</strong></dd></div><div><dt>시험실</dt><dd>${esc(equipmentName(r.equipmentId))}</dd></div><div><dt>시험 종류</dt><dd>${esc(r.testType)}</dd></div><div><dt>담당자</dt><dd>${esc(userName(r.ownerId))}</dd></div><div><dt>상태</dt><dd><span class="tag ${statusClass(r.status)}">${r.status}</span></dd></div><div class="full"><dt>예약 기간</dt><dd>${dateText(r.start)} ~ ${dateText(r.end)}</dd></div><div class="full"><dt>주말 포함</dt><dd>${r.includeWeekend ? '포함' : r.equipmentId === 'endurance' && r.testType !== '성능시험' ? '연속 가동' : '기본 운영일'}</dd></div><div class="full"><dt>가동실적</dt><dd>${!a ? '미입력' : a.zero ? '0시간 · ' + esc(a.note) : dateText(a.start) + ' ~ ' + dateText(a.end)}</dd></div>${r.note ? `<div class="full"><dt>비고</dt><dd>${esc(r.note)}</dd></div>` : ''}</dl><div class="inline-actions"><button class="quiet" data-edit="${r.id}">${icon('pencil')}계획 수정</button>${r.status !== '취소' ? `<button class="primary" data-actual="${r.id}">${icon('timer')}실적 입력</button>` : ''}${a ? `<button class="quiet danger" data-remove-actual="${r.id}">${icon('trash-2')}실적 삭제</button>` : ''}${canDelete ? `<button class="quiet danger" data-remove-reservation="${r.id}" data-version="${r.version}" title="시험·실적·변경 이력 삭제">${icon('trash-2')}시험 삭제</button>` : ''}</div><p id="reservation-delete-error" class="error" role="alert"></p><div class="section-heading"><h2>변경 이력</h2></div>${hist.reverse().map(h => `<div class="history-item"><strong>${esc(h.reason)}</strong><small>${dateText(h.at)} · ${esc(userName(h.userId))}</small><p>${h.before ? `${dateText(h.before.start)} ~ ${dateText(h.before.end)} / ${esc(h.before.status)} →<br>` : '최초 계획: '}${dateText(h.after.start)} ~ ${dateText(h.after.end)} / ${esc(h.after.status)}</p></div>`).join('')}`);
+  if(durationInfo)$('#modal-body').insertAdjacentHTML('afterbegin',durationInfo);
 }
 function actualForm(id) {
   const r = data.reservations.find(r => r.id === id), a = data.actuals.find(a => a.reservationId === id);
@@ -338,7 +345,9 @@ $('#auth-form').onsubmit = async event => { event.preventDefault(); const form =
   try { const account = await api(setup ? '/api/setup' : '/api/login', 'POST', Object.fromEntries(new FormData(form))); me = account.user; csrf = account.csrf; setup = false; await enter(); }
   catch (e) { $('#auth-error').textContent = e.message; } finally { button.disabled = false; } };
 $('#logout').onclick = async () => { try { await api('/api/logout', 'POST'); me = null; csrf = ''; await init(); } catch (e) { error(e.message); } };
-$('.sidebar nav').onclick = event => { const button = event.target.closest('[data-page]'); if (button && me) { page = button.dataset.page; actualState = ''; render(); } };
+$('.sidebar nav').onclick = event => { const button = event.target.closest('[data-page]'); if (button && me) { monthlyPlanner?.invalidatePreview();page = button.dataset.page; actualState = ''; render(); } };
+$('#content').addEventListener('input',event=>monthlyPlanner?.handleChange(event));
+$('#content').addEventListener('change',event=>{if(event.target.tagName==='SELECT')monthlyPlanner?.handleChange(event);});
 document.addEventListener('click', event => {
   const card = event.target.closest('[data-summary]'); if (!card || !me) return;
   page = ['equipment', 'occupancy'].includes(card.dataset.summary) ? 'capacity' : 'tests';
@@ -379,6 +388,7 @@ $('#export').onclick = () => { const p = period(); window.location.href = `/api/
 document.addEventListener('click', async event => {
   if (!me) return; const b = event.target.closest('button, .booking-entry');
   try {
+    if(b?.hasAttribute('data-monthly-action')){await plannerUI().handleClick(event);return;}
     if (b?.dataset.openDay) { clearRange(); date = b.dataset.openDay; mode = 'day'; await refresh(); }
     else if (b?.dataset.openMonth) { clearRange(); date = b.dataset.openMonth + '-01'; mode = 'month'; await refresh(); }
     else if (b?.dataset.detail) await detail(b.dataset.detail);

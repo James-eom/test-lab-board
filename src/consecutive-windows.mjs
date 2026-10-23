@@ -1,4 +1,4 @@
-import { EQUIPMENT, DEFAULT_RULES, MIN, DAY, ms, dayStart, reservationRules, isAroundClock, isContinuous, isOperatingDay, validateInterval, windows } from './operating-rules.mjs';
+import { EQUIPMENT, DEFAULT_RULES, MIN, DAY, OFFSET, ms, dayStart, reservationRules, isAroundClock, isContinuous, isOperatingDay, validateInterval, windows } from './operating-rules.mjs';
 const window = (a,b) => ({start:new Date(a).toISOString(),end:new Date(b).toISOString()});
 export function consecutiveWindowsBetween(r, rules=DEFAULT_RULES, {validateOperatingDays=true}={}) {
   const [a,b]=validateInterval(r.start,r.end);
@@ -52,6 +52,10 @@ export function validatePlannedWindows(r,rules=DEFAULT_RULES,{validateOperatingD
   }
   // Stored occupancy stays immutable; current non-operating days are filtered at read time.
   const current=reservationRules(r,rules);
+  if(!isAroundClock(r)) {
+    if(normalized.some(i=>ms(i.start)<dayStart(ms(i.start))+current.open*MIN||ms(i.end)>dayStart(ms(i.start))+current.close*MIN))throw new Error('기존 예약 구간이 운영시간 밖에 있습니다.');
+    if([normalized[0].start,normalized.at(-1).start].some(t=>!current.days.includes(new Date(ms(t)+OFFSET).getUTCDay())))throw new Error('시작일과 종료일은 운영일이어야 합니다.');
+  }
   return isAroundClock(r)?normalized:normalized.filter(i=>isOperatingDay(ms(i.start),current));
 }
 export function actualReservation(r,actual,rules=DEFAULT_RULES) {

@@ -50,3 +50,9 @@ test('atomic batch rollback, stale guards and idempotency prevent partial or res
     assert.throws(()=>s.saveMonthlySchedule({previewId:'past',userId:u.id,revision:s.monthlyScheduleRevision(),assignments:[row],nowMs:Date.parse(iso('2026-11-09T09:00'))}));
   }finally{s.db.close();}
 });
+test('automatic bookings retain the existing protection against incompatible operating rule edits',()=>{
+  const {s,save}=fixture();try{
+    save();assert.throws(()=>s.saveRules({...s.rules(),open:570}),e=>e.status===409);
+    assert.throws(()=>s.saveRules({...s.rules(),close:1200}),e=>e.status===409);
+  }finally{s.db.close();}
+});
