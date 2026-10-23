@@ -1,6 +1,16 @@
 import { test, expect } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 
+async function seedTodayTests(page, bookings) {
+  const response = await page.request.post('/api/login', { data: { login: 'testadmin', password: 'test-only-password-123' } });
+  expect(response.ok()).toBe(true);
+  const account = await response.json();
+  for (const booking of bookings) {
+    const saved = await page.request.post('/api/reservations', { headers: { 'x-csrf-token': account.csrf }, data: { title: booking.testType, project: '오늘 팝업 검증', ownerId: account.user.id, status: '계획', ...booking } });
+    expect(saved.status(), await saved.text()).toBe(201);
+  }
+}
+
 test('two team sessions, calendars, actuals, settings, and mobile layout', async ({ page, browser }) => {
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   await mkdir('test-results/screenshots', { recursive: true });
@@ -17,11 +27,15 @@ test('two team sessions, calendars, actuals, settings, and mobile layout', async
   await page.locator('#auth-form [name=password]').fill('test-only-password-123');
   await page.locator('#auth-submit').click();
   await expect(page.locator('.schedule-table tbody tr')).toHaveCount(6);
+  await expect(page.locator('[data-page=schedule]')).toHaveText('가동 현황');
+  await expect(page.locator('[data-page=tests]')).toHaveText('시험 계획 수립');
+  await expect(page.locator('[data-page=capacity]')).toHaveText('설비 CAPA 현황');
+  await expect(page.locator('#page-title')).toHaveText('가동 현황');
   await expect(page.locator('[data-summary]')).toHaveCount(4);
   await page.locator('[data-summary="tests"]').click();
-  await expect(page.locator('#page-title')).toHaveText('시험계획');
+  await expect(page.locator('#page-title')).toHaveText('시험 계획 수립');
   await page.locator('[data-summary="occupancy"]').click();
-  await expect(page.locator('#page-title')).toHaveText('설비 CAPA');
+  await expect(page.locator('#page-title')).toHaveText('설비 CAPA 현황');
   await page.locator('[data-page="schedule"]').click();
   await page.locator('#date-picker').fill('2026-10-12');
   await page.locator('#date-picker').dispatchEvent('change');
@@ -75,16 +89,18 @@ test('two team sessions, calendars, actuals, settings, and mobile layout', async
   await page.locator('#reservation-form [name=testType]').selectOption('열피로 시험');
   await page.locator('#reservation-form [name=start]').fill('2026-10-12T08:30');
   await page.locator('#reservation-form [name=end]').fill('2026-10-14T20:30');
-  await page.locator('#reservation-form [name=status]').selectOption('진행');
+  await expect(page.locator('#reservation-form [name=status]')).toHaveCount(0);
   await page.locator('#reservation-form [type=submit]').click();
   await expect(page.locator('#modal')).not.toBeVisible();
   await expect(page.locator('.booking')).toHaveCount(3);
   await expect(page.locator('.booking strong').first()).toHaveText('열피로 시험');
+  const registered = (await (await page.request.get('/api/state')).json()).reservations.find(r => r.project === 'KA5 t-car');
+  expect(registered.status).toBe('계획');
   const thermalComparison = page.locator('.schedule-table tbody tr').filter({ hasText: '열가진 내구시험실 #1' }).locator('.equipment-comparison');
   await expect(thermalComparison).toContainText('최초 계획36 h');
   await expect(thermalComparison).toContainText('미입력 1건');
   await page.locator('[data-summary="missing"]').click();
-  await expect(page.locator('#page-title')).toHaveText('시험계획');
+  await expect(page.locator('#page-title')).toHaveText('시험 계획 수립');
   await expect(page.locator('.data-table')).toContainText('KA5 t-car');
   await page.locator('[data-page="schedule"]').click();
   await page2.locator('#date-picker').fill('2026-10-12'); await page2.locator('#date-picker').dispatchEvent('change');
@@ -107,6 +123,8 @@ test('two team sessions, calendars, actuals, settings, and mobile layout', async
   await page.locator('[data-edit]').click();
   await expect(page.locator('#reservation-form [name=title]')).toHaveCount(0);
   await expect(page.locator('#reservation-form [name=project]')).toHaveValue('KA5 t-car');
+  await expect(page.locator('#reservation-form [name=status]')).toHaveCount(0);
+  await expect(page.locator('#reservation-form [name=reason]')).toHaveAttribute('required', '');
   await page.locator('#reservation-form [name=reason]').fill('폼 구성 확인');
   await page.locator('#reservation-form [type=submit]').click();
   await expect(page.locator('#modal')).not.toBeVisible();
@@ -447,4 +465,103 @@ test('new room-specific types retain manual registration after automatic plannin
   expect(saved.equipmentId).toBe('endurance'); expect(saved.intervals).toHaveLength(2);
   await expect(page.locator('[data-page=planner]')).toHaveCount(0);
   expect(errors).toEqual([]);
+});
+
+test('today popup opens once per entry, ignores search dates and never changes registered statuses', async ({ page }) => {
+  await page.clock.setFixedTime(new Date('2026-10-13T01:00:00Z'));
+  await seedTodayTests(page, [
+    { equipmentId: 'engine-1', testType: '배압 시험', title: '<오늘 예정>', start: '2026-10-13T18:30:00+09:00', end: '2026-10-13T20:30:00+09:00' },
+    { equipmentId: 'thermal-2', testType: 'Glass Wool 내구', status: '진행', start: '2026-10-12T08:30:00+09:00', end: '2026-10-14T20:30:00+09:00' },
+    { equipmentId: 'endurance', testType: '단품 대상내구 시험', start: '2026-10-12T12:00:00+09:00', end: '2026-10-14T12:00:00+09:00' },
+    { equipmentId: 'thermal-1', testType: '열피로 시험', title: '완료는 제외', status: '완료', start: '2026-10-13T08:30:00+09:00', end: '2026-10-13T20:30:00+09:00' },
+    { equipmentId: 'engine-1', testType: '배압 시험', title: '취소는 제외', status: '취소', start: '2026-10-13T18:30:00+09:00', end: '2026-10-13T20:30:00+09:00' },
+    { equipmentId: 'engine-2', testType: '배압 시험', title: '미래는 제외', start: '2026-10-14T18:30:00+09:00', end: '2026-10-14T20:30:00+09:00' }
+  ]);
+  const before = (await (await page.request.get('/api/state')).json()).reservations;
+  await page.goto('/');
+  await expect(page.locator('#modal-title')).toHaveText('오늘의 시험 현황');
+  await expect(page.locator('.today-test')).toHaveCount(3);
+  await expect(page.locator('.today-tests-summary')).toContainText('2026-10-13');
+  await expect(page.locator('.today-tests-summary')).toContainText('진행 예정 2건 · 진행 중 1건');
+  await expect(page.locator('.today-tests')).toContainText('<오늘 예정>');
+  await expect(page.locator('.today-tests')).toContainText('18:30~20:30');
+  await expect(page.locator('.today-tests')).toContainText('08:30~20:30');
+  await expect(page.locator('.today-tests')).toContainText('00:00~24:00');
+  await expect(page.locator('.today-tests')).not.toContainText('완료는 제외');
+  await expect(page.locator('.today-tests')).not.toContainText('취소는 제외');
+  await expect(page.locator('.today-tests')).not.toContainText('미래는 제외');
+  await page.locator('.today-tests [data-close]').click();
+  const refreshed = page.waitForResponse(r => r.url().includes('/api/capacity?'));
+  await page.locator('#refresh').click(); await refreshed;
+  await expect(page.locator('#modal')).not.toBeVisible();
+  await page.locator('#date-picker').fill('2027-01-04'); await page.locator('#date-picker').dispatchEvent('change');
+  await expect(page.locator('#period-title')).toContainText('1월');
+  await page.locator('#logout').click();
+  await page.locator('#auth-form [name=login]').fill('testadmin');
+  await page.locator('#auth-form [name=password]').fill('test-only-password-123');
+  await page.locator('#auth-submit').click();
+  await expect(page.locator('#modal')).toBeVisible();
+  await expect(page.locator('.today-tests-summary')).toContainText('2026-10-13');
+  await expect(page.locator('.today-test')).toHaveCount(3);
+  expect((await (await page.request.get('/api/state')).json()).reservations).toEqual(before);
+});
+
+test('Korean-day holiday popup excludes ordinary bookings but includes continuous tests on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  // UTC is still October 4, but the Korean date is the October 5 substitute holiday.
+  await page.clock.setFixedTime(new Date('2026-10-04T15:30:00Z'));
+  await seedTodayTests(page, [
+    { equipmentId: 'engine-1', testType: '배압 시험', title: '공휴일에 쉬는 시험', start: '2026-10-02T08:30:00+09:00', end: '2026-10-06T20:30:00+09:00' },
+    { equipmentId: 'endurance', testType: 'SN 커브 추출시험', start: '2026-10-05T00:00:00+09:00', end: '2026-10-06T00:00:00+09:00' }
+  ]);
+  await page.goto('/');
+  await expect(page.locator('#modal')).toBeVisible();
+  await expect(page.locator('.today-tests-summary')).toContainText('2026-10-05');
+  await expect(page.locator('.today-test')).toHaveCount(1);
+  await expect(page.locator('.today-tests')).toContainText('SN 커브 추출시험');
+  await expect(page.locator('.today-tests')).not.toContainText('공휴일에 쉬는 시험');
+  await expect(page.locator('.today-tests')).toContainText('00:00~24:00');
+  expect(await page.locator('#modal').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await page.locator('.today-tests [data-close]').click();
+  await page.clock.setFixedTime(new Date('2026-11-03T01:00:00Z'));
+  const refreshed = page.waitForResponse(r => r.url().includes('/api/capacity?'));
+  await page.reload(); await refreshed;
+  await expect(page.locator('.schedule-table')).toBeVisible();
+  await expect(page.locator('#modal')).not.toBeVisible();
+});
+
+test('reservation edits hide status, require a reason and preserve every existing status and history', async ({ page }) => {
+  await page.clock.setFixedTime(new Date('2030-01-07T01:00:00Z'));
+  const states = ['계획', '진행', '완료', '취소'];
+  const rooms = ['engine-1', 'engine-2', 'thermal-1', 'thermal-2'];
+  await seedTodayTests(page, states.map((status, i) => ({ equipmentId: rooms[i], testType: i < 2 ? '배압 시험' : 'Glass Wool 내구', project: `상태 보존 검증-${status}`, status, start: '2026-11-09T09:00:00+09:00', end: '2026-11-09T10:00:00+09:00' })));
+  const records = (await (await page.request.get('/api/state')).json()).reservations.filter(r => r.project.startsWith('상태 보존 검증-'));
+  await page.goto('/');
+  await expect(page.locator('.schedule-table')).toBeVisible();
+  await page.locator('#date-picker').fill('2026-11-09'); await page.locator('#date-picker').dispatchEvent('change');
+  await expect(page.locator('#period-title')).toContainText('11월');
+  await page.locator('[data-page=tests]').click();
+  for (const record of records) {
+    await page.locator('.data-table tbody tr').filter({ hasText: record.project }).getByRole('button', { name: '시험 상세' }).click();
+    await page.locator('[data-edit]').click();
+    const form = page.locator('#reservation-form');
+    await expect(form.locator('[name=status]')).toHaveCount(0);
+    await expect(form.locator('[name=reason]')).toHaveAttribute('required', '');
+    await form.locator('[type=submit]').click();
+    await expect(form).toBeVisible();
+    expect(await form.locator('[name=reason]').evaluate(el => el.validity.valueMissing)).toBe(true);
+    const reason = `상태 ${record.status} 유지하며 비고 수정`;
+    await form.locator('[name=reason]').fill(reason);
+    await form.locator('[name=note]').fill('수동 상태 입력 없이 수정');
+    const saving = page.waitForResponse(r => r.url().endsWith('/api/reservations/' + record.id) && r.request().method() === 'PUT');
+    await form.locator('[type=submit]').click();
+    const response = await saving; expect(response.status()).toBe(200);
+    expect((await response.json()).status).toBe(record.status);
+    await expect(page.locator('#modal')).not.toBeVisible();
+    const history = await (await page.request.get(`/api/reservations/${record.id}/history`)).json();
+    expect(history).toHaveLength(2);
+    expect(history[1].reason).toBe(reason);
+    expect(history[1].before.status).toBe(record.status);
+    expect(history[1].after.status).toBe(record.status);
+  }
 });

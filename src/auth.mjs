@@ -21,5 +21,5 @@ export function sessionFor(store, req) {
   if (!token) return null;
   const session = store.db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(tokenHash(token), Date.now());
   if (!session) return null;
-  const user = store.users().find(u => u.id === session.userId); return user ? { ...session, user } : null;
+  const user = store.users().find(u => u.id === session.userId && u.active); return user ? { ...session, user } : null;
 }

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- For a DEDICATED HTTPS proxy site, not C:\LabPlanner. Requires IIS ARR + URL Rewrite,
+     proxy enabled, and preserveHostHeader=true. Review existing server-wide settings first. -->
+<configuration>
+  <system.webServer>
+    <rewrite>
+      <rules>
+        <rule name="LabPlannerProxy" stopProcessing="true">
+          <match url="(.*)" />
+          <action type="Rewrite" url="http://127.0.0.1:4317/{R:1}" />
+        </rule>
+      </rules>
+    </rewrite>
+  </system.webServer>
+</configuration>

@@ -18,7 +18,8 @@ const statusClass = value => ({ 진행: 'running', 완료: 'complete', 취소: '
 let me, csrf = '', setup = false, data, capa = [], page = 'schedule', mode = 'week', date = today(), refreshBusy = false;
 let search = '', owner = '', status = '', actualState = '';
 let range = null, rangeDraft = false, refreshQueued = false;
-const userName = id => data.users.find(u => u.id === id)?.name || '미지정';
+let todayPopupPending = false;
+const userName = id => { const u = data.users.find(u => u.id === id); return u ? u.name + (u.active === false ? ' (삭제됨)' : '') : '미지정'; };
 const equipmentName = id => data.equipment.find(e => e.id === id)?.name || id;
 const holidayName = day => data.rules.holidays.filter(h => h.date === day).map(h => h.name).join(' / ');
 function holidaySummary() {
@@ -57,6 +58,7 @@ async function init() {
   icons();
 }
 async function enter() {
+  todayPopupPending = true;
   $('#auth-screen').classList.add('hidden'); $('#app-screen').classList.remove('hidden'); $('#logout').classList.remove('hidden'); $('#user-name').textContent = me.name;
   $('#auth-form').reset(); await refresh();
 }
@@ -69,14 +71,27 @@ async function refresh() {
     const nextData = await api('/api/state?' + query), nextCapa = await api('/api/capacity?' + query);
     const current = period();
     if (current.start !== p.start || current.end !== p.end) { refreshQueued = true; return; }
-    data = nextData; capa = nextCapa; $('#sync-status').textContent = '서버 연결됨'; $('#error-banner').classList.add('hidden'); render();
+    data = nextData; capa = nextCapa; me = data.users.find(u => u.id === me?.id) || me; $('#user-name').textContent = me?.name || ''; $('#sync-status').textContent = '서버 연결됨'; $('#error-banner').classList.add('hidden'); render();
+    showTodayTests();
   }
   catch (e) { error(e.message); $('#sync-status').textContent = '연결 확인 필요'; }
   finally { refreshBusy = false; if (refreshQueued) { refreshQueued = false; void refresh(); } }
 }
+function showTodayTests() {
+  if (!todayPopupPending || !me || $('#modal').open || $('#conflict-popup').open) return;
+  todayPopupPending = false;
+  const day = today(), start = Date.parse(midnight(day)), end = start + 86400000;
+  const tests = data.reservations.filter(r => ['계획', '진행'].includes(r.status)).map(r => ({ ...r,
+    todayIntervals: (r.intervals || []).map(i => [Math.max(start, Date.parse(i.start)), Math.min(end, Date.parse(i.end))]).filter(([a, b]) => a < b)
+  })).filter(r => r.todayIntervals.length).sort((a, b) => a.todayIntervals[0][0] - b.todayIntervals[0][0] || a.equipmentId.localeCompare(b.equipmentId));
+  if (!tests.length) return;
+  const planned = tests.filter(r => r.status === '계획').length;
+  const clock = value => value === end ? '24:00' : timeText(value);
+  modal('오늘의 시험 현황', `<section class="today-tests" aria-label="오늘의 시험 현황"><p class="today-tests-summary">${day} · 한국시간 기준<br>진행 예정 ${planned}건 · 진행 중 ${tests.length - planned}건</p><p class="muted">조회 기간·검색 조건과 관계없이 모든 시험실의 오늘 예약을 표시합니다. 상태는 등록된 값이며 실제 가동 여부를 자동 판단하지 않습니다.</p><div class="today-tests-list">${tests.map(r => `<article class="today-test"><div class="today-test-heading"><strong>${esc(equipmentName(r.equipmentId))}</strong><span class="tag ${statusClass(r.status)}">${esc(r.status)}</span></div><h3>${esc(r.title)}</h3><dl><div><dt>시험 항목</dt><dd>${esc(r.testType)}</dd></div><div><dt>프로젝트</dt><dd>${esc(r.project || '미등록')}</dd></div><div><dt>담당자</dt><dd>${esc(userName(r.ownerId))}</dd></div><div><dt>오늘 예약 시간</dt><dd>${r.todayIntervals.map(([a, b]) => `${clock(a)}~${clock(b)}`).join(' / ')}</dd></div></dl></article>`).join('')}</div><div class="form-actions"><button type="button" class="primary" data-close>확인</button></div></section>`);
+}
 function render() {
   if (!data || !me) return;
-  const titles = { schedule: ['가동계획', '장비별 시험 일정과 가동 시간을 확인합니다.'], tests: ['시험계획', '시험별 일정, 담당자와 진행 상태를 관리합니다.'], capacity: ['설비 CAPA', '선택 기간의 가용 시간과 계획·실적을 비교합니다.'], history: ['기준계획 · 이력', '월간 기준계획과 현재 일정의 차이를 확인합니다.'], settings: ['운영 설정', '팀 계정과 설비 운영 기준을 관리합니다.'] };
+  const titles = { schedule: ['가동 현황', '장비별 시험 일정과 가동 시간을 확인합니다.'], tests: ['시험 계획 수립', '시험별 일정, 담당자와 진행 상태를 관리합니다.'], capacity: ['설비 CAPA 현황', '선택 기간의 가용 시간과 계획·실적을 비교합니다.'], history: ['기준계획 · 이력', '월간 기준계획과 현재 일정의 차이를 확인합니다.'], settings: ['운영 설정', '팀 계정과 설비 운영 기준을 관리합니다.'] };
   $('#page-title').textContent = titles[page][0]; $('#page-description').textContent = titles[page][1];
   document.querySelectorAll('.nav').forEach(b => b.classList.toggle('active', b.dataset.page === page));
   document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('selected', b.dataset.mode === mode));
@@ -88,7 +103,7 @@ function render() {
   $('#range-status').textContent = range ? `기간 검색 적용 중 · 종료일 포함 ${p.days.length}일` : '종료일 포함 · 최대 10년 조회';
   $('#range-form').classList.toggle('applied', !!range);
   $('#search').value = search;
-  $('#owner-filter').innerHTML = '<option value="">모든 담당자</option>' + data.users.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join(''); $('#owner-filter').value = owner;
+  $('#owner-filter').innerHTML = '<option value="">모든 담당자</option>' + data.users.map(u => `<option value="${u.id}">${esc(userName(u.id))}</option>`).join(''); $('#owner-filter').value = owner;
   const selected = filtered().filter(r => r.status !== '취소');
   const available = capa.reduce((sum, c) => sum + c.availableMinutes, 0), planned = capa.reduce((sum, c) => sum + c.plannedMinutes, 0);
   const running = selected.filter(r => r.status === '진행').length, missing = capa.reduce((sum, c) => sum + c.missingActuals, 0);
@@ -204,7 +219,11 @@ function settingsView() {
   const r = data.rules, p = period(), start = new Date(midnight(p.start)).toISOString(), end = new Date(midnight(p.end)).toISOString();
   const stops = data.downtimes.filter(d => !range || (d.start < end && d.end > start));
   const clock = v => `${String(Math.floor(v / 60)).padStart(2, '0')}:${String(v % 60).padStart(2, '0')}`;
-  return `<section class="setting-band"><h3>기본 운영 기준</h3><p>${r.days.map(d => daysLabel[d]).join(' · ')}요일 / ${clock(r.open)}~${clock(r.close)}<br>휴식 ${r.breaks.map(([a, b]) => `${clock(a)}~${clock(b)}`).join(' / ')}<br>열가진 연속시험과 단품 대상내구는 별도 기준 적용</p>${me.role === 'admin' ? `<div class="inline-actions"><button class="quiet" id="edit-rules">${icon('sliders-horizontal')}운영 기준 수정</button><button class="quiet" id="add-downtime">${icon('wrench')}설비 정지 등록</button></div>` : ''}</section><div class="section-heading"><h2>팀 계정 <span class="muted">${data.users.length}/6</span></h2>${me.role === 'admin' && data.users.length < 6 ? `<button class="quiet" id="add-user">${icon('user-plus')}팀원 등록</button>` : ''}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>이름</th><th>아이디</th><th>권한</th></tr></thead><tbody>${data.users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.login)}</td><td>${u.role === 'admin' ? '관리자' : '팀원'}</td></tr>`).join('')}</tbody></table></div><div class="section-heading"><h2>${range ? '조회 구간 ' : ''}설비 정지 일정</h2></div>${stops.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>시험실</th><th>기간</th><th>사유</th><th></th></tr></thead><tbody>${stops.map(d => `<tr><td>${esc(equipmentName(d.equipmentId))}</td><td>${dateText(d.start)}~${dateText(d.end)}</td><td>${esc(d.reason)}</td><td>${me.role === 'admin' ? `<button class="icon-button" data-remove-downtime="${d.id}" title="정지 일정 삭제" aria-label="정지 일정 삭제">${icon('trash-2')}</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : empty('설비 정지 일정이 없습니다.', '')}`;
+  return `<section class="setting-band"><h3>기본 운영 기준</h3><p>${r.days.map(d => daysLabel[d]).join(' · ')}요일 / ${clock(r.open)}~${clock(r.close)}<br>휴식 ${r.breaks.map(([a, b]) => `${clock(a)}~${clock(b)}`).join(' / ')}<br>열가진 연속시험과 단품 대상내구는 별도 기준 적용</p>${me.role === 'admin' ? `<div class="inline-actions"><button class="quiet" id="edit-rules">${icon('sliders-horizontal')}운영 기준 수정</button><button class="quiet" id="add-downtime">${icon('wrench')}설비 정지 등록</button></div>` : ''}</section>${userSettings()}<div class="section-heading"><h2>${range ? '조회 구간 ' : ''}설비 정지 일정</h2></div>${stops.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>시험실</th><th>기간</th><th>사유</th><th></th></tr></thead><tbody>${stops.map(d => `<tr><td>${esc(equipmentName(d.equipmentId))}</td><td>${dateText(d.start)}~${dateText(d.end)}</td><td>${esc(d.reason)}</td><td>${me.role === 'admin' ? `<button class="icon-button" data-remove-downtime="${d.id}" title="정지 일정 삭제" aria-label="정지 일정 삭제">${icon('trash-2')}</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : empty('설비 정지 일정이 없습니다.', '')}`;
+}
+function userSettings() {
+  const count = data.users.filter(u => u.active).length, admin = me.role === 'admin';
+  return `<div class="section-heading"><h2>팀 계정 <span class="muted">사용 중 ${count}/6</span></h2>${admin ? `<button class="quiet" id="add-user" ${count >= 6 ? 'disabled' : ''}>${icon('user-plus')}팀원 등록</button>` : ''}</div><p class="muted">관리자 포함 최대 6명입니다. ${count >= 6 ? '정원에 도달했습니다. 불필요한 계정을 삭제하면 새 팀원을 등록할 수 있습니다. ' : ''}삭제는 로그인 차단이며 시험 일정과 변경 이력은 보존됩니다.</p><div class="table-wrap"><table class="data-table"><thead><tr><th>이름</th><th>아이디</th><th>권한</th><th>상태</th>${admin ? '<th>계정 관리</th>' : ''}</tr></thead><tbody>${data.users.map(u => `<tr data-user-id="${u.id}"><td>${esc(u.name)}</td><td>${esc(u.login)}</td><td>${u.role === 'admin' ? '관리자' : '팀원'}</td><td>${u.active ? '사용 중' : '삭제됨'}</td>${admin ? `<td>${u.active ? `<button class="quiet" data-edit-user="${u.id}">${icon('pencil')}ID·비밀번호 설정</button>${u.id !== me.id ? ` <button class="quiet danger" data-remove-user="${u.id}">${icon('trash-2')}삭제</button>` : ''}` : '<span class="muted">이력 보존</span>'}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 function empty(title, subtitle, add = false) { return `<div class="empty-state">${icon('calendar-days')}<h3>${title}</h3><p>${subtitle}</p>${add ? `<button class="quiet" data-add>${icon('plus')}시험 등록</button>` : ''}</div>`; }
 function holidaySettings() {
@@ -252,7 +271,7 @@ function reservationForm(r, equipmentId, day, minute) {
   const at = minute !== undefined ? Math.min(Math.max(Number(minute), data.rules.open), data.rules.close - 60) : data.rules.open;
   const start = r ? local(r.start) : local(new Date(new Date(midnight(d)).getTime() + (eq === 'endurance' && minute !== undefined ? Number(minute) : at) * 60000));
   const end = r ? local(r.end) : local(new Date(new Date(start + ':00+09:00').getTime() + 3600000));
-  modal(r ? '시험계획 수정' : '시험 등록', `<form id="reservation-form" data-id="${r?.id || ''}"><div class="form-grid"><label class="full">차종 / 프로젝트<input name="project" value="${esc(r?.project || '')}" maxlength="100"></label><label>시험실<select name="equipmentId">${data.equipment.map(e => option(e.id, e.name, eq)).join('')}</select></label><label>시험 종류<select name="testType"></select></label><label class="full">담당자<select name="ownerId">${data.users.map(u => option(u.id, u.name, r?.ownerId || me.id)).join('')}</select></label><label>시작 일시<input name="start" type="datetime-local" step="1800" value="${start}" required></label><label>종료 일시<input name="end" type="datetime-local" step="1800" value="${end}" required></label><label class="full checkbox-label"><input type="checkbox" name="includeWeekend" ${r?.includeWeekend ? 'checked' : ''}>주말 포함</label><label>상태<select name="status">${['계획', '진행', '완료', '취소'].map(s => option(s, s, r?.status || '계획')).join('')}</select></label>${r ? '<label>변경 사유<input name="reason" required maxlength="500"></label>' : ''}<label class="full">비고<textarea name="note" maxlength="2000">${esc(r?.note || '')}</textarea></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">${icon('check')}저장</button></div></form>`);
+  modal(r ? '시험계획 수정' : '시험 등록', `<form id="reservation-form" data-id="${r?.id || ''}"><div class="form-grid"><label class="full">차종 / 프로젝트<input name="project" value="${esc(r?.project || '')}" maxlength="100"></label><label>시험실<select name="equipmentId">${data.equipment.map(e => option(e.id, e.name, eq)).join('')}</select></label><label>시험 종류<select name="testType"></select></label><label class="full">담당자<select name="ownerId">${data.users.filter(u => u.active || u.id === r?.ownerId).map(u => option(u.id, userName(u.id), r?.ownerId || me.id)).join('')}</select></label><label>시작 일시<input name="start" type="datetime-local" step="1800" value="${start}" required></label><label>종료 일시<input name="end" type="datetime-local" step="1800" value="${end}" required></label><label class="full checkbox-label"><input type="checkbox" name="includeWeekend" ${r?.includeWeekend ? 'checked' : ''}>주말 포함</label>${r ? '<label>변경 사유<input name="reason" required maxlength="500"></label>' : ''}<label class="full">비고<textarea name="note" maxlength="2000">${esc(r?.note || '')}</textarea></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button type="submit" class="primary">${icon('check')}저장</button></div></form>`);
   const form = $('#reservation-form'), typeSelect = form.elements.testType;
   form.querySelector('.error').insertAdjacentHTML('beforebegin', '<p class="muted" id="reservation-operating-rule"></p>');
   const syncOperatingRule = () => {
@@ -274,7 +293,7 @@ function reservationForm(r, equipmentId, day, minute) {
   setTypes(); syncWeekend(); syncOperatingRule(); typeSelect.onchange = syncOperatingRule;
   form.elements.equipmentId.onchange = () => { setTypes(); syncWeekend(); syncOperatingRule(); };
   form.elements.start.onchange = syncWeekend; form.elements.end.onchange = syncWeekend;
-  form.onsubmit = async event => { event.preventDefault(); syncWeekend(); const values = Object.fromEntries(new FormData(form)); values.title = values.testType; values.includeWeekend = !form.elements.includeWeekend.disabled && form.elements.includeWeekend.checked; values.start = iso(values.start); values.end = iso(values.end); if (r) values.version = r.version;
+  form.onsubmit = async event => { event.preventDefault(); syncWeekend(); const values = Object.fromEntries(new FormData(form)); values.title = values.testType; values.status = r?.status || '계획'; values.includeWeekend = !form.elements.includeWeekend.disabled && form.elements.includeWeekend.checked; values.start = iso(values.start); values.end = iso(values.end); if (r) values.version = r.version;
     await saveForm(form, () => api('/api/reservations' + (r ? '/' + r.id : ''), r ? 'PUT' : 'POST', values), '시험계획을 저장했습니다.'); };
 }
 async function saveForm(form, operation, message) {
@@ -286,7 +305,8 @@ async function saveForm(form, operation, message) {
 async function detail(id) {
   const r = data.reservations.find(r => r.id === id); if (!r) return;
   const hist = await api(`/api/reservations/${r.id}/history`), a = data.actuals.find(a => a.reservationId === r.id);
-  modal('시험 상세', `<dl class="detail-grid"><div class="full"><dt>시험명</dt><dd><strong>${esc(r.title)}</strong></dd></div><div><dt>시험실</dt><dd>${esc(equipmentName(r.equipmentId))}</dd></div><div><dt>시험 종류</dt><dd>${esc(r.testType)}</dd></div><div><dt>담당자</dt><dd>${esc(userName(r.ownerId))}</dd></div><div><dt>상태</dt><dd><span class="tag ${statusClass(r.status)}">${r.status}</span></dd></div><div class="full"><dt>예약 기간</dt><dd>${dateText(r.start)} ~ ${dateText(r.end)}</dd></div><div class="full"><dt>주말 포함</dt><dd>${r.includeWeekend ? '포함' : r.equipmentId === 'endurance' && r.testType !== '성능시험' ? '연속 가동' : '기본 운영일'}</dd></div><div class="full"><dt>가동실적</dt><dd>${!a ? '미입력' : a.zero ? '0시간 · ' + esc(a.note) : dateText(a.start) + ' ~ ' + dateText(a.end)}</dd></div>${r.note ? `<div class="full"><dt>비고</dt><dd>${esc(r.note)}</dd></div>` : ''}</dl><div class="inline-actions"><button class="quiet" data-edit="${r.id}">${icon('pencil')}계획 수정</button>${r.status !== '취소' ? `<button class="primary" data-actual="${r.id}">${icon('timer')}실적 입력</button>` : ''}${a ? `<button class="quiet danger" data-remove-actual="${r.id}">${icon('trash-2')}실적 삭제</button>` : ''}</div><div class="section-heading"><h2>변경 이력</h2></div>${hist.reverse().map(h => `<div class="history-item"><strong>${esc(h.reason)}</strong><small>${dateText(h.at)} · ${esc(userName(h.userId))}</small><p>${h.before ? `${dateText(h.before.start)} ~ ${dateText(h.before.end)} / ${esc(h.before.status)} →<br>` : '최초 계획: '}${dateText(h.after.start)} ~ ${dateText(h.after.end)} / ${esc(h.after.status)}</p></div>`).join('')}`);
+  const canDelete = me.role === 'admin' || (hist[0]?.before === null && hist[0].userId === me.id);
+  modal('시험 상세', `<dl class="detail-grid"><div class="full"><dt>시험명</dt><dd><strong>${esc(r.title)}</strong></dd></div><div><dt>시험실</dt><dd>${esc(equipmentName(r.equipmentId))}</dd></div><div><dt>시험 종류</dt><dd>${esc(r.testType)}</dd></div><div><dt>담당자</dt><dd>${esc(userName(r.ownerId))}</dd></div><div><dt>상태</dt><dd><span class="tag ${statusClass(r.status)}">${r.status}</span></dd></div><div class="full"><dt>예약 기간</dt><dd>${dateText(r.start)} ~ ${dateText(r.end)}</dd></div><div class="full"><dt>주말 포함</dt><dd>${r.includeWeekend ? '포함' : r.equipmentId === 'endurance' && r.testType !== '성능시험' ? '연속 가동' : '기본 운영일'}</dd></div><div class="full"><dt>가동실적</dt><dd>${!a ? '미입력' : a.zero ? '0시간 · ' + esc(a.note) : dateText(a.start) + ' ~ ' + dateText(a.end)}</dd></div>${r.note ? `<div class="full"><dt>비고</dt><dd>${esc(r.note)}</dd></div>` : ''}</dl><div class="inline-actions"><button class="quiet" data-edit="${r.id}">${icon('pencil')}계획 수정</button>${r.status !== '취소' ? `<button class="primary" data-actual="${r.id}">${icon('timer')}실적 입력</button>` : ''}${a ? `<button class="quiet danger" data-remove-actual="${r.id}">${icon('trash-2')}실적 삭제</button>` : ''}${canDelete ? `<button class="quiet danger" data-remove-reservation="${r.id}" data-version="${r.version}" title="시험·실적·변경 이력 삭제">${icon('trash-2')}시험 삭제</button>` : ''}</div><p id="reservation-delete-error" class="error" role="alert"></p><div class="section-heading"><h2>변경 이력</h2></div>${hist.reverse().map(h => `<div class="history-item"><strong>${esc(h.reason)}</strong><small>${dateText(h.at)} · ${esc(userName(h.userId))}</small><p>${h.before ? `${dateText(h.before.start)} ~ ${dateText(h.before.end)} / ${esc(h.before.status)} →<br>` : '최초 계획: '}${dateText(h.after.start)} ~ ${dateText(h.after.end)} / ${esc(h.after.status)}</p></div>`).join('')}`);
 }
 function actualForm(id) {
   const r = data.reservations.find(r => r.id === id), a = data.actuals.find(a => a.reservationId === id);
@@ -294,9 +314,9 @@ function actualForm(id) {
   const form = $('#actual-form'); form.onsubmit = event => { event.preventDefault(); const v = Object.fromEntries(new FormData(form)); const zero = form.elements.zero.checked;
     saveForm(form, () => api('/api/actuals', 'POST', { reservationId: id, zero, note: v.note, ...(!zero ? { start: iso(v.start), end: iso(v.end) } : {}) }), '실적을 저장했습니다.'); };
 }
-function userForm() {
-  modal('팀원 등록', `<form id="user-form"><div class="form-grid"><label>이름<input name="name" required maxlength="40"></label><label>아이디<input name="login" required pattern="[a-zA-Z0-9._-]{3,40}"></label><label class="full">초기 비밀번호<input name="password" type="password" autocomplete="new-password" required minlength="10" maxlength="200"></label><label>권한<select name="role"><option value="member">팀원</option><option value="admin">관리자</option></select></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button class="primary" type="submit">팀원 등록</button></div></form>`);
-  const form = $('#user-form'); form.onsubmit = event => { event.preventDefault(); saveForm(form, () => api('/api/users', 'POST', Object.fromEntries(new FormData(form))), '팀원을 등록했습니다.'); };
+function userForm(u) {
+  modal(u ? '팀원 계정 설정' : '팀원 등록', `<form id="user-form"><p class="muted">${u ? '새 비밀번호를 비워 두면 기존 비밀번호를 유지합니다. ID·비밀번호·권한을 바꾸면 해당 계정은 다시 로그인해야 합니다. 기존 비밀번호는 조회할 수 없습니다.' : '관리자가 초기 아이디와 비밀번호를 지정합니다. 아이디는 영문·숫자 및 . _ -를 사용해 3~40자로 입력해 주세요.'}</p><div class="form-grid"><label>이름<input name="name" value="${esc(u?.name || '')}" required maxlength="40"></label><label>아이디<input name="login" value="${esc(u?.login || '')}" autocomplete="off" required pattern="[a-zA-Z0-9._-]{3,40}" maxlength="40"></label><label class="full">${u ? '새 비밀번호 (변경할 때만 입력)' : '초기 비밀번호'}<input name="password" type="password" autocomplete="new-password" ${u ? '' : 'required'} minlength="10" maxlength="200"><small>10~200자 · 다른 사이트와 다른 비밀번호를 사용해 주세요.</small></label><label>권한<select name="role">${option('member', '팀원', u?.role || 'member')}${option('admin', '관리자', u?.role || 'member')}</select></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button class="primary" type="submit">${u ? '설정 저장' : '팀원 등록'}</button></div></form>`);
+  const form = $('#user-form'); form.onsubmit = event => { event.preventDefault(); saveForm(form, () => api('/api/users' + (u ? '/' + u.id : ''), u ? 'PUT' : 'POST', { ...Object.fromEntries(new FormData(form)), ...(u ? { version: u.version } : {}) }), u ? '계정 설정을 저장했습니다.' : '팀원을 등록했습니다.'); };
 }
 function downtimeForm() {
   modal('설비 정지 등록', `<form id="downtime-form"><div class="warning-note">예약과 겹치는 정지시간은 CAPA에서 제외되며 기존 예약은 보존됩니다.</div><div class="form-grid"><label class="full">시험실<select name="equipmentId">${data.equipment.map(e => option(e.id, e.name)).join('')}</select></label><label>정지 시작<input name="start" type="datetime-local" step="1800" value="${date}T08:30" required></label><label>정지 종료<input name="end" type="datetime-local" step="1800" value="${date}T20:30" required></label><label class="full">사유<input name="reason" required maxlength="500"></label></div><p class="error" role="alert"></p><div class="form-actions"><button type="button" class="quiet" data-close>닫기</button><button class="primary" type="submit">정지 등록</button></div></form>`);
@@ -364,6 +384,22 @@ document.addEventListener('click', async event => {
     else if (b?.dataset.detail) await detail(b.dataset.detail);
     else if (b?.dataset.edit) reservationForm(data.reservations.find(r => r.id === b.dataset.edit));
     else if (b?.dataset.actual) actualForm(b.dataset.actual);
+    else if (b?.dataset.removeReservation) {
+      b.disabled = true;
+      const message = $('#reservation-delete-error'); message.textContent = '';
+      const origin = $('#modal'), sameDetail = () => origin.open && b.isConnected && message.isConnected;
+      try {
+        const path = '/api/reservations/' + b.dataset.removeReservation;
+        const preview = await api(path + '/deletion-preview');
+        if (!sameDetail()) return;
+        if (preview.version !== Number(b.dataset.version)) throw new Error('시험 정보가 변경되었습니다. 상세 창을 다시 열고 삭제해 주세요.');
+        if (!confirm('정말로 삭제하시겠습니까?')) return;
+        await api(path, 'DELETE', { confirmation: '시험 삭제', revision: preview.revision });
+        if (sameDetail()) origin.close();
+        toast('시험을 삭제했습니다. 삭제 전 백업이 저장되었습니다.'); await refresh();
+      } catch (e) { if (sameDetail()) message.textContent = e.message; else error(e.message); }
+      finally { b.disabled = false; }
+    }
     else if (b?.dataset.removeActual && confirm('이 시험의 실적을 삭제할까요? 계획은 유지되고 실적은 미입력으로 돌아갑니다.')) {
       b.disabled = true;
       try { await api('/api/actuals/' + b.dataset.removeActual, 'DELETE'); $('#modal').close(); toast('실적을 삭제했습니다.'); await refresh(); }
@@ -371,6 +407,8 @@ document.addEventListener('click', async event => {
     }
     else if (b?.hasAttribute('data-add')) reservationForm();
     else if (b?.id === 'add-user') userForm();
+    else if (b?.dataset.editUser) userForm(data.users.find(u => u.id === b.dataset.editUser));
+    else if (b?.dataset.removeUser && confirm('이 계정의 로그인을 차단하고 기존 접속을 해제할까요? 시험 일정과 변경 이력은 삭제하지 않습니다. 삭제된 아이디는 재사용할 수 없습니다.')) { await api('/api/users/' + b.dataset.removeUser, 'DELETE'); toast('계정을 삭제했습니다. 시험 이력은 보존됩니다.'); await refresh(); }
     else if (b?.id === 'add-downtime') downtimeForm();
     else if (b?.id === 'edit-rules') rulesForm();
     else if (b?.id === 'delete-all-schedules') await scheduleDeleteForm();

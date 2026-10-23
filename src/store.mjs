@@ -11,7 +11,7 @@ export class Store {
   constructor(path) {
     this.db = new DatabaseSync(path);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, login TEXT UNIQUE NOT NULL, name TEXT NOT NULL, hash TEXT NOT NULL, role TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, login TEXT UNIQUE NOT NULL, name TEXT NOT NULL, hash TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, version INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, userId TEXT NOT NULL REFERENCES users(id), csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS intervals(reservationId TEXT NOT NULL REFERENCES reservations(id), equipmentId TEXT NOT NULL, start TEXT NOT NULL, end TEXT NOT NULL);
@@ -22,17 +22,51 @@ export class Store {
       CREATE TABLE IF NOT EXISTS downtimes(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS automatic_plans(id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
+    if (!this.db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'active')) this.db.exec('ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
+    if (!this.db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'version')) this.db.exec('ALTER TABLE users ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
   }
   transaction(fn) { this.db.exec('BEGIN IMMEDIATE'); try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (e) { this.db.exec('ROLLBACK'); throw e; } }
-  users() { return this.db.prepare('SELECT id,login,name,role FROM users ORDER BY name').all(); }
+  users() { return this.db.prepare('SELECT id,login,name,role,active,version FROM users ORDER BY name').all().map(u => ({ ...u, active: !!u.active })); }
   addUser(login, name, hash, role = 'member') {
-    if (!/^[a-zA-Z0-9._-]{3,40}$/.test(login)) fail('아이디는 영문·숫자 3~40자로 입력해 주세요.');
-    if (!['admin', 'member'].includes(role)) fail('권한을 확인해 주세요.');
-    const user = { id: randomUUID(), login, name: text(name, 40), role };
-    if (!user.name) fail('이름을 입력해 주세요.');
-    try { this.db.prepare('INSERT INTO users VALUES(?,?,?,?,?)').run(user.id, login, user.name, hash, role); }
-    catch (e) { if (e.message.includes('UNIQUE')) fail('이미 등록된 아이디입니다.', 409); throw e; }
-    return user;
+    return this.transaction(() => {
+      if (this.users().filter(u => u.active).length >= 6) fail('사용 중인 계정은 관리자 포함 6명까지 등록할 수 있습니다. 불필요한 계정을 삭제한 후 등록해 주세요.');
+      if (!/^[a-zA-Z0-9._-]{3,40}$/.test(login)) fail('아이디는 영문·숫자 3~40자로 입력해 주세요.');
+      if (!['admin', 'member'].includes(role)) fail('권한을 확인해 주세요.');
+      const user = { id: randomUUID(), login, name: text(name, 40), role, active: true, version: 1 };
+      if (!user.name) fail('이름을 입력해 주세요.');
+      try { this.db.prepare('INSERT INTO users(id,login,name,hash,role) VALUES(?,?,?,?,?)').run(user.id, login, user.name, hash, role); }
+      catch (e) { if (e.message.includes('UNIQUE')) fail('이미 등록된 아이디입니다. 삭제된 계정의 아이디도 재사용할 수 없습니다.', 409); throw e; }
+      return user;
+    });
+  }
+  updateUser(id, input, hash) {
+    return this.transaction(() => {
+      const old = this.users().find(u => u.id === id);
+      if (!old) fail('계정을 찾을 수 없습니다.', 404);
+      if (!old.active) fail('삭제된 계정은 수정할 수 없습니다.', 409);
+      if (input.version !== undefined && input.version !== old.version) fail('다른 관리자가 계정 정보를 변경했습니다. 창을 닫고 새로고침한 후 다시 설정해 주세요.', 409);
+      const { login, role } = input, name = text(input.name, 40);
+      if (typeof login !== 'string' || !/^[a-zA-Z0-9._-]{3,40}$/.test(login)) fail('아이디는 영문·숫자 3~40자로 입력해 주세요.');
+      if (!name) fail('이름을 입력해 주세요.');
+      if (!['admin', 'member'].includes(role)) fail('권한을 확인해 주세요.');
+      if (old.role === 'admin' && role !== 'admin' && this.users().filter(u => u.active && u.role === 'admin').length <= 1) fail('마지막 관리자의 권한을 변경할 수 없습니다.');
+      try { this.db.prepare('UPDATE users SET login=?,name=?,role=?,hash=COALESCE(?,hash),version=version+1 WHERE id=?').run(login, name, role, hash ?? null, id); }
+      catch (e) { if (e.message.includes('UNIQUE')) fail('이미 등록된 아이디입니다. 삭제된 계정의 아이디도 재사용할 수 없습니다.', 409); throw e; }
+      if (hash !== undefined || old.login !== login || old.role !== role) this.db.prepare('DELETE FROM sessions WHERE userId=?').run(id);
+      return this.users().find(u => u.id === id);
+    });
+  }
+  removeUser(id, actorId) {
+    return this.transaction(() => {
+      const user = this.users().find(u => u.id === id);
+      if (!user) fail('계정을 찾을 수 없습니다.', 404);
+      if (!user.active) fail('이미 삭제된 계정입니다.', 409);
+      if (id === actorId) fail('본인 계정은 삭제할 수 없습니다.');
+      if (user.role === 'admin' && this.users().filter(u => u.active && u.role === 'admin').length <= 1) fail('마지막 관리자 계정은 삭제할 수 없습니다.');
+      this.db.prepare('UPDATE users SET active=0,version=version+1 WHERE id=?').run(id);
+      this.db.prepare('DELETE FROM sessions WHERE userId=?').run(id);
+      return { ok: true };
+    });
   }
   customHolidays() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='holidays'").get()) || []; }
   holidayApiKey() { return parse(this.db.prepare("SELECT payload FROM settings WHERE key='holiday-api-key'").get()) || ''; }
@@ -80,7 +114,7 @@ export class Store {
       if (!e || (!e.types.includes(input.testType) && !unchangedLegacyType)) fail('설비와 시험 종류를 확인해 주세요.');
       if (input.includeWeekend !== undefined && typeof input.includeWeekend !== 'boolean') fail('주말 포함 여부를 확인해 주세요.');
       if (input.includeWeekend === true && !supportsWeekend(e.id)) fail('이 설비에는 주말 포함 옵션을 적용할 수 없습니다.');
-      if (!this.users().some(u => u.id === input.ownerId)) fail('담당자를 선택해 주세요.');
+      if (!this.users().some(u => u.id === input.ownerId && (u.active || old?.ownerId === u.id))) fail('사용 중인 담당자를 선택해 주세요.');
       if (!['계획', '진행', '완료', '취소'].includes(input.status)) fail('상태를 확인해 주세요.');
       const r = { id: id || randomUUID(), equipmentId: e.id, testType: input.testType, title: text(input.title, 160), project: text(input.project || '', 100), ownerId: input.ownerId,
         start: new Date(input.start).toISOString(), end: new Date(input.end).toISOString(), includeWeekend: input.includeWeekend === true, status: input.status, note: text(input.note || '', 2000), version: (old?.version || 0) + 1, createdAt: old?.createdAt || now(), updatedAt: now(), ...(old?.automaticPlan ? { automaticPlan: old.automaticPlan } : {}) };
@@ -101,6 +135,25 @@ export class Store {
       if (r.status !== '취소') for (const i of intervals) this.db.prepare('INSERT INTO intervals VALUES(?,?,?,?)').run(r.id, r.equipmentId, i.start, i.end);
       this.db.prepare('INSERT INTO history(reservationId,payload) VALUES(?,?)').run(r.id, JSON.stringify({ before: old, after: r, ...(!old ? { plannedIntervals: activeIntervals(r, this.rules()) } : {}), reason: text(input.reason || '최초 등록', 500), userId, at: now() }));
       return r;
+  }
+  reservationDeletionPreview(id, userId) {
+    const reservation = this.reservation(id);
+    if (!reservation) fail('삭제할 시험이 없습니다. 최신 내용을 확인해 주세요.', 404);
+    const snapshot = { reservation,
+      intervals: this.db.prepare('SELECT * FROM intervals WHERE reservationId=? ORDER BY rowid').all(id),
+      actuals: this.db.prepare('SELECT * FROM actuals WHERE reservationId=?').all(id),
+      history: this.db.prepare('SELECT * FROM history WHERE reservationId=? ORDER BY seq').all(id) };
+    const user = this.users().find(u => u.id === userId && u.active), first = parse(snapshot.history[0]);
+    if (!user || (user.role !== 'admin' && !(first?.before === null && first.userId === user.id))) fail('시험은 관리자 또는 최초 등록자만 삭제할 수 있습니다.', 403);
+    return { version: reservation.version, revision: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex') };
+  }
+  deleteReservation(id, revision, userId) {
+    return this.transaction(() => {
+      if (revision !== this.reservationDeletionPreview(id, userId).revision) fail('시험 정보나 실적이 변경되었습니다. 상세 창을 다시 열고 삭제해 주세요.', 409, 'STALE_DELETION');
+      for (const table of ['intervals', 'actuals', 'history']) this.db.prepare(`DELETE FROM ${table} WHERE reservationId=?`).run(id);
+      this.db.prepare('DELETE FROM reservations WHERE id=?').run(id);
+      return { ok: true };
+    });
   }
   scheduleDeletionPreview() {
     const tables = ['intervals', 'actuals', 'history', 'baselines', 'automatic_plans', 'reservations'];
