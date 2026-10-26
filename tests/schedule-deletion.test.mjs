@@ -78,3 +78,16 @@ test('transaction rejects changes after backup and rolls all deletions back on e
     assert.deepEqual(app.store.scheduleDeletionPreview(), fresh);
   } finally { app.store.db.close(); }
 });
+test('administrator revoked while bulk-deletion backup is pending cannot delete schedules',async()=>{
+  let resume,entered;const started=new Promise(r=>entered=r);
+  const app=createApp({dbPath:':memory:',backupDb:async()=>{entered();await new Promise(r=>resume=r);return 'test-only-backup.sqlite';}});
+  await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base=`http://127.0.0.1:${app.server.address().port}`;
+  try{
+    const response=await fetch(base+'/api/setup',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({login:'manager',name:'관리자',password:'test-password-123'})}),account=await response.json();
+    const headers={cookie:response.headers.get('set-cookie').split(';')[0],'x-csrf-token':account.csrf,'content-type':'application/json'};
+    app.store.addUser('otheradmin','다른 관리자','hash','admin');
+    app.store.saveReservation({title:'보존',equipmentId:'engine-1',testType:'배압 시험',ownerId:account.user.id,start:'2026-11-09T08:30:00+09:00',end:'2026-11-09T09:30:00+09:00',status:'계획'},account.user.id);
+    const pending=fetch(base+'/api/schedules',{method:'DELETE',headers,body:JSON.stringify({confirmation:'전체 시험 일정 삭제',revision:app.store.scheduleDeletionPreview().revision})});await started;
+    app.store.updateUser(account.user.id,{...account.user,role:'member'});resume();assert.equal((await pending).status,401);assert.equal(app.store.reservations().length,1);
+  }finally{await new Promise(r=>app.server.close(r));app.store.db.close();}
+});
